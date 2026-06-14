@@ -1,0 +1,183 @@
+# World Loom Server
+
+This repository owns the future Rust authoritative server for World Loom Online.
+
+M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client through the existing temporary local bridge. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. The server remains intentionally small: no complex permission system, no browser WSS endpoint inside Rust yet, no new gameplay, and no Valence core fork.
+
+## What M2 Provides
+
+- Valence server using Minecraft protocol 1.20.1.
+- Offline auth mode for local development.
+- Bounded 128x128 superflat world centered at `0,0`.
+- Players spawn at the center in creative mode.
+- Hotbar slots contain basic building blocks.
+- Player block placement and removal route through `WorldCommand`.
+- `WorldCommand` validates bounds, allowed block types, empty placement targets, non-air anchors, spawn-space safety, and protected foundation blocks.
+
+## What M4 Adds
+
+- Multiple browser clients can join the same in-memory server world.
+- Block place/remove mutations still route through `WorldCommand` and replicate through Valence world state.
+- Disconnect/reconnect keeps the in-memory world state valid while the server process remains running.
+- Debug telemetry reports server tick timing, connected player count, and per-player ping status through logs plus tab list/action bar messages.
+- Client FPS remains a browser-client concern and is shown through the existing client debug overlay when renderer FPS is available.
+
+## What M5 Adds
+
+- SQLite persistence through `rusqlite`.
+- Successful `WorldCommand` mutations enqueue block edits to a background writer.
+- The writer batches updates and keeps disk I/O off the gameplay event path.
+- Server startup loads saved `block_overrides` after generating the bounded base world.
+- Reverting a cell back to its generated base block removes the override.
+- Removing a generated base-world block persists an explicit `air` override.
+- A command log records successful `set_block` and `remove_block` operations.
+
+## What M6 Adds
+
+- Local MCP endpoint at `http://127.0.0.1:8765/mcp`.
+- Streamable HTTP-style JSON-RPC support for `initialize`, `ping`, `tools/list`, and `tools/call`.
+- Read-only tools: `server_status`, `list_players`, `get_world_bounds`, `get_block`, `snapshot_region`.
+- Edit tools: `set_block`, `remove_block`, `fill_region`.
+- MCP HTTP handlers enqueue requests only; live world reads/writes happen on the server update loop.
+- All MCP edit tools route through `WorldCommand` validation.
+- Successful MCP edits enqueue SQLite persistence and replicate to connected browser clients.
+
+## Run
+
+```sh
+cargo run
+```
+
+The server listens on Valence's default `0.0.0.0:25565`.
+
+By default, M5 saves to:
+
+```text
+data/world-loom.sqlite3
+```
+
+Use `WORLD_LOOM_DB_PATH` to override the save path for local tests:
+
+```sh
+WORLD_LOOM_DB_PATH=/tmp/world-loom-test.sqlite3 cargo run
+```
+
+The MCP endpoint defaults to:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+Override it with:
+
+```sh
+WORLD_LOOM_MCP_ADDR=127.0.0.1:9876 cargo run
+```
+
+## Connect
+
+Use a Minecraft Java 1.20.1-compatible client:
+
+```text
+Server address: localhost:25565
+Authentication: offline/local development
+```
+
+For another machine on the same private network, use the host machine's LAN or Tailscale address with port `25565`.
+
+The browser client path in M3/M4 uses the current `minecraft-web-client` proxy flow as a temporary bridge:
+
+1. Start this server with `cargo run`.
+2. In `world-loom-client`, run `pnpm start:world-loom`.
+3. Open the browser client and connect to `localhost:25565` with version `1.20.1`.
+4. Use local proxy `:18080` rather than a public proxy, because this server is local/private.
+5. Use distinct usernames for multiple browser clients.
+
+## Checks
+
+```sh
+cargo fmt
+cargo clippy
+cargo test
+```
+
+The stack-level smoke tests start the local repos and run browser verification:
+
+```sh
+../scripts/smoke-m4-dual-client.sh
+../scripts/smoke-m5-persistence.sh
+../scripts/smoke-m6-mcp.sh
+```
+
+## MCP Tools
+
+Read-only:
+
+- `server_status`: tick, player count, bounds, database path, MCP endpoint.
+- `list_players`: connected player names, positions, and ping.
+- `get_world_bounds`: bounded world coordinates.
+- `get_block`: one live block.
+- `snapshot_region`: live block snapshot with max volume `512`.
+
+Edit:
+
+- `set_block`: one block; supported blocks are `stone`, `dirt`, `grass_block`, `oak_planks`, `cobblestone`, and `glass`.
+- `remove_block`: one block removal.
+- `fill_region`: bounded cuboid edit with max volume `128`; accepts the same set blocks plus `air` for removal.
+
+All edit tools use `WorldCommand`, so bounds, spawn protection, foundation protection, supported block checks, target occupancy, and placement anchor rules still apply.
+
+## SQLite Schema
+
+`world_metadata`
+
+- `world_id`
+- `schema_version`
+- bounded world min/max coordinates
+- timestamps
+
+`block_overrides`
+
+- `world_id`
+- `x`, `y`, `z`
+- `block_state_raw`
+- `updated_at`
+
+`command_log`
+
+- append-only successful command rows
+- `command_kind`
+- `x`, `y`, `z`
+- final `block_state_raw`
+- `recorded_at`
+
+`block_state_raw` is Valence `BlockState::to_raw()` for the current Minecraft protocol version.
+
+## Reset / Backup
+
+Back up the local save by copying the SQLite file while the server is stopped:
+
+```sh
+cp data/world-loom.sqlite3 /path/to/world-loom-backup.sqlite3
+```
+
+Clear the default local save:
+
+```sh
+./scripts/clear-save.sh
+```
+
+The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
+
+## Not In M6
+
+- No complex MCP permission system.
+- No browser-facing WSS endpoint.
+- No client UI rewrite.
+- No new gameplay systems.
+- No infinite world persistence.
+- No Valence core changes.
+
+## Next Direction
+
+V0 acceptance should run M4, M5, and M6 smoke tests together, then harden private-host deployment, MCP authorization, and the production browser WSS path.
