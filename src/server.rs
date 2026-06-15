@@ -6,6 +6,7 @@ use valence::keepalive::Ping;
 use valence::prelude::*;
 use valence::spawn::IsFlat;
 
+use crate::bridge::BridgeRuntime;
 use crate::mcp::{
     block_json, block_state_name, required_block_pos, required_block_state, required_region,
     McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS,
@@ -47,6 +48,12 @@ pub fn run() {
     let mcp = McpRuntime::start_default()
         .unwrap_or_else(|err| panic!("failed to start local MCP server: {err}"));
     println!("[world-loom] MCP endpoint=http://{}/mcp", mcp.addr());
+    let bridge = BridgeRuntime::start_default()
+        .unwrap_or_else(|err| panic!("failed to start browser bridge: {err}"));
+    println!(
+        "[world-loom] browser bridge endpoint=http://{}",
+        bridge.addr()
+    );
 
     App::new()
         .insert_resource(NetworkSettings {
@@ -58,6 +65,7 @@ pub fn run() {
         })
         .insert_resource(persistence)
         .insert_resource(mcp)
+        .insert_resource(bridge)
         .add_plugins(DefaultPlugins)
         .add_systems(Startup, setup_world)
         .add_systems(

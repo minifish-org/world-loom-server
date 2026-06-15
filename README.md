@@ -2,7 +2,7 @@
 
 This repository owns the future Rust authoritative server for World Loom Online.
 
-M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client through the existing temporary local bridge. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. The server remains intentionally small: no complex permission system, no browser WSS endpoint inside Rust yet, no new gameplay, and no Valence core fork.
+M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
 
 ## What M2 Provides
 
@@ -42,6 +42,20 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 - All MCP edit tools route through `WorldCommand` validation.
 - Successful MCP edits enqueue SQLite persistence and replicate to connected browser clients.
 
+## What V1.1 Adds
+
+- Rust-owned browser bridge endpoint compatible with the existing `minecraft-web-client` proxy protocol.
+- Default bridge address: `http://127.0.0.1:18081/api/vm/net`.
+- Valence TCP remains on `0.0.0.0:25565`.
+- Browser traffic no longer requires the client-owned Node `server.js` bridge on the target path.
+
+## What V1.2 Documents
+
+- Tailscale private-host deployment.
+- Caddy HTTPS/WSS reverse proxy in front of the local Rust bridge.
+- Pages/client environment variables and required allowed origins.
+- Persistent SQLite data directory, backup, and clear-save workflow.
+
 ## Run
 
 ```sh
@@ -74,6 +88,30 @@ Override it with:
 WORLD_LOOM_MCP_ADDR=127.0.0.1:9876 cargo run
 ```
 
+The browser bridge endpoint defaults to:
+
+```text
+http://127.0.0.1:18081/api/vm/net
+```
+
+Override it with:
+
+```sh
+WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18082 cargo run
+```
+
+Allowed browser origins default to local Rsbuild dev origins:
+
+```text
+http://localhost:3000,http://127.0.0.1:3000
+```
+
+Override them with:
+
+```sh
+WORLD_LOOM_ALLOWED_ORIGINS=http://localhost:3000 cargo run
+```
+
 ## Connect
 
 Use a Minecraft Java 1.20.1-compatible client:
@@ -85,13 +123,29 @@ Authentication: offline/local development
 
 For another machine on the same private network, use the host machine's LAN or Tailscale address with port `25565`.
 
-The browser client path in M3/M4 uses the current `minecraft-web-client` proxy flow as a temporary bridge:
+The browser client path uses the Rust-owned bridge:
 
 1. Start this server with `cargo run`.
 2. In `world-loom-client`, run `pnpm start:world-loom`.
 3. Open the browser client and connect to `localhost:25565` with version `1.20.1`.
-4. Use local proxy `:18080` rather than a public proxy, because this server is local/private.
+4. Use local proxy `:18081`, which points at this server's browser bridge.
 5. Use distinct usernames for multiple browser clients.
+
+The old Node bridge in `world-loom-client/server.js` is retained only as a fallback/debug tool, normally on `:18080`.
+
+## Tailscale Deployment
+
+Use `docs/tailscale-deployment.md` for the family-play deployment runbook:
+
+```text
+Cloudflare Pages static client
+  -> Tailscale HTTPS/WSS host
+  -> Caddy reverse proxy
+  -> Rust browser bridge on 127.0.0.1:18081
+  -> Valence TCP server on localhost:25565
+```
+
+The deployment path keeps MCP on `127.0.0.1:8765` by default.
 
 ## Checks
 
@@ -169,10 +223,10 @@ Clear the default local save:
 
 The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
 
-## Not In M6
+## Not In V1.2
 
 - No complex MCP permission system.
-- No browser-facing WSS endpoint.
+- No public Cloudflare Worker proxy.
 - No client UI rewrite.
 - No new gameplay systems.
 - No infinite world persistence.
@@ -180,4 +234,4 @@ The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses p
 
 ## Next Direction
 
-V0 acceptance should run M4, M5, and M6 smoke tests together, then harden private-host deployment, MCP authorization, and the production browser WSS path.
+After V1.2, the next practical hardening work is Tailscale/Pages manual acceptance, production process management, and later MCP authorization.
