@@ -2,7 +2,7 @@
 
 This repository owns the future Rust authoritative server for World Loom Online.
 
-M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
+M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
 
 ## What M2 Provides
 
@@ -55,6 +55,17 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 - Caddy HTTPS/WSS reverse proxy in front of the local Rust bridge.
 - Pages/client environment variables and required allowed origins.
 - Persistent SQLite data directory, backup, and clear-save workflow.
+
+## What V2 Adds
+
+- Server tick/MSPT telemetry in logs, tab list/action bar, and MCP `server_status`.
+- Per-player ping visibility remains in tab/action bar, player list, and MCP status.
+- Valence `ViewDistance` based chunk interest management with a bounded server default.
+- Rust browser bridge backpressure knobs: TCP read buffer size, WebSocket queue capacity, and pending connection limit.
+- SQLite save format versioning with V1 metadata migration.
+- `WorldStorage` trait plus the current `SqliteDeltaStorage` implementation.
+- SQLite writer queue stats in MCP `server_status`.
+- Online-safe backup script with a JSON manifest.
 
 ## Run
 
@@ -112,6 +123,17 @@ Override them with:
 WORLD_LOOM_ALLOWED_ORIGINS=http://localhost:3000 cargo run
 ```
 
+V2 networking and interest defaults can also be tuned:
+
+```sh
+WORLD_LOOM_VIEW_DISTANCE_CHUNKS=6 cargo run
+WORLD_LOOM_BRIDGE_TCP_READ_BUFFER_BYTES=16384 cargo run
+WORLD_LOOM_BRIDGE_WS_QUEUE_CAPACITY=1024 cargo run
+WORLD_LOOM_BRIDGE_MAX_PENDING_CONNECTIONS=128 cargo run
+```
+
+`WORLD_LOOM_VIEW_DISTANCE_CHUNKS` is clamped to `2..=12` by this server. Valence still owns the actual chunk synchronization.
+
 ## Connect
 
 Use a Minecraft Java 1.20.1-compatible client:
@@ -167,7 +189,7 @@ The stack-level smoke tests start the local repos and run browser verification:
 
 Read-only:
 
-- `server_status`: tick, player count, bounds, database path, MCP endpoint.
+- `server_status`: tick, player count, bounds, database path, MCP endpoint, MSPT telemetry, chunk interest stats, bridge backpressure config, SQLite schema/save format versions, and writer queue stats.
 - `list_players`: connected player names, positions, and ping.
 - `get_world_bounds`: bounded world coordinates.
 - `get_block`: one live block.
@@ -186,9 +208,17 @@ All edit tools use `WorldCommand`, so bounds, spawn protection, foundation prote
 `world_metadata`
 
 - `world_id`
+- `storage_backend`
 - `schema_version`
+- `save_format_version`
 - bounded world min/max coordinates
 - timestamps
+
+`schema_migrations`
+
+- applied schema version rows
+- migration description
+- timestamp
 
 `block_overrides`
 
@@ -209,11 +239,13 @@ All edit tools use `WorldCommand`, so bounds, spawn protection, foundation prote
 
 ## Reset / Backup
 
-Back up the local save by copying the SQLite file while the server is stopped:
+Back up the local save with the V2 backup script:
 
 ```sh
-cp data/world-loom.sqlite3 /path/to/world-loom-backup.sqlite3
+./scripts/backup-save.sh
 ```
+
+By default this writes an ignored `backups/world-loom-*.sqlite3` file plus a JSON manifest. Set `WORLD_LOOM_DB_PATH` and `WORLD_LOOM_BACKUP_DIR` to override the source and destination.
 
 Clear the default local save:
 
@@ -223,7 +255,7 @@ Clear the default local save:
 
 The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
 
-## Not In V1.2
+## Not In V2
 
 - No complex MCP permission system.
 - No public Cloudflare Worker proxy.
@@ -231,7 +263,8 @@ The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses p
 - No new gameplay systems.
 - No infinite world persistence.
 - No Valence core changes.
+- No Anvil/region storage implementation.
 
 ## Next Direction
 
-After V1.2, the next practical hardening work is Tailscale/Pages manual acceptance, production process management, and later MCP authorization.
+After V2, the next practical hardening work is production process management, deeper storage evaluation, and later MCP authorization.

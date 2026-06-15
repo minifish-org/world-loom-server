@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::env;
 use std::time::Instant;
 
 use valence::interact_block::InteractBlockEvent;
@@ -11,18 +13,37 @@ use crate::mcp::{
     block_json, block_state_name, required_block_pos, required_block_state, required_region,
     McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS,
 };
-use crate::persistence::{PersistenceRuntime, SavedBlockOverride};
+use crate::persistence::{PersistenceRuntime, PersistenceStatsSnapshot, SavedBlockOverride};
 use crate::world_command::{
     execute_world_command, CommandContext, WorldBounds, WorldCommand, GROUND_Y, HOTBAR_BLOCKS,
     SPAWN_FEET_Y, WORLD_BOUNDS,
 };
 
 const TELEMETRY_INTERVAL_TICKS: i64 = 20;
+const TELEMETRY_WINDOW_SAMPLES: usize = 30;
 const MAX_MCP_REQUESTS_PER_TICK: usize = 64;
+pub const VIEW_DISTANCE_ENV: &str = "WORLD_LOOM_VIEW_DISTANCE_CHUNKS";
+const DEFAULT_VIEW_DISTANCE_CHUNKS: u8 = 6;
+const MAX_VIEW_DISTANCE_CHUNKS: u8 = 12;
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct WorldRules {
     bounds: WorldBounds,
+}
+
+#[derive(Resource, Debug, Clone, Copy)]
+struct InterestConfig {
+    view_distance_chunks: u8,
+}
+
+impl InterestConfig {
+    fn from_env() -> Self {
+        Self {
+            view_distance_chunks: bounded_view_distance(
+                env::var(VIEW_DISTANCE_ENV).ok().as_deref(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,11 +58,98 @@ struct TelemetrySample {
     instant: Instant,
 }
 
+#[derive(Resource, Debug)]
+struct ServerTelemetry {
+    snapshot: TelemetrySnapshot,
+    mspt_window: VecDeque<f64>,
+}
+
+impl Default for ServerTelemetry {
+    fn default() -> Self {
+        Self {
+            snapshot: TelemetrySnapshot::default(),
+            mspt_window: VecDeque::with_capacity(TELEMETRY_WINDOW_SAMPLES),
+        }
+    }
+}
+
+impl ServerTelemetry {
+    fn record(
+        &mut self,
+        tick: i64,
+        last_mspt: f64,
+        players: Vec<PlayerTelemetry>,
+        loaded_chunks: usize,
+        view_distance_chunks: u8,
+        world_chunk_columns: usize,
+    ) {
+        if self.mspt_window.len() == TELEMETRY_WINDOW_SAMPLES {
+            self.mspt_window.pop_front();
+        }
+        self.mspt_window.push_back(last_mspt);
+
+        let avg_mspt = average_mspt(&self.mspt_window);
+        let max_mspt = self.mspt_window.iter().copied().fold(0.0_f64, f64::max);
+
+        self.snapshot = TelemetrySnapshot {
+            tick,
+            last_mspt,
+            avg_mspt,
+            max_mspt,
+            players,
+            loaded_chunks,
+            view_distance_chunks,
+            interest_chunks_per_player: interest_chunk_capacity(view_distance_chunks),
+            world_chunk_columns,
+            window_samples: self.mspt_window.len(),
+        };
+    }
+
+    fn snapshot(&self) -> &TelemetrySnapshot {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TelemetrySnapshot {
+    tick: i64,
+    last_mspt: f64,
+    avg_mspt: f64,
+    max_mspt: f64,
+    players: Vec<PlayerTelemetry>,
+    loaded_chunks: usize,
+    view_distance_chunks: u8,
+    interest_chunks_per_player: usize,
+    world_chunk_columns: usize,
+    window_samples: usize,
+}
+
+impl Default for TelemetrySnapshot {
+    fn default() -> Self {
+        Self {
+            tick: 0,
+            last_mspt: 0.0,
+            avg_mspt: 0.0,
+            max_mspt: 0.0,
+            players: Vec::new(),
+            loaded_chunks: 0,
+            view_distance_chunks: DEFAULT_VIEW_DISTANCE_CHUNKS,
+            interest_chunks_per_player: interest_chunk_capacity(DEFAULT_VIEW_DISTANCE_CHUNKS),
+            world_chunk_columns: WORLD_BOUNDS.loaded_chunk_columns(),
+            window_samples: 0,
+        }
+    }
+}
+
 pub fn run() {
     let persistence = PersistenceRuntime::open_default()
         .unwrap_or_else(|err| panic!("failed to initialize SQLite persistence: {err}"));
+    let persistence_stats = persistence.stats_snapshot();
     println!(
-        "[world-loom] SQLite save path={} loaded_block_overrides={}",
+        "[world-loom] storage={} schema_version={} save_format_version={} path={} loaded_block_overrides={}",
+        persistence_stats.storage_backend,
+        persistence_stats.schema_version,
+        persistence_stats.save_format_version,
         persistence.db_path().display(),
         persistence.loaded_overrides().len()
     );
@@ -54,6 +162,19 @@ pub fn run() {
         "[world-loom] browser bridge endpoint=http://{}",
         bridge.addr()
     );
+    let bridge_config = bridge.config();
+    println!(
+        "[world-loom] bridge backpressure tcp_read_buffer={} ws_queue_capacity={} max_pending_connections={}",
+        bridge_config.tcp_read_buffer_bytes,
+        bridge_config.ws_queue_capacity,
+        bridge_config.max_pending_connections
+    );
+    let interest = InterestConfig::from_env();
+    println!(
+        "[world-loom] chunk interest view_distance_chunks={} loaded_chunk_columns={}",
+        interest.view_distance_chunks,
+        WORLD_BOUNDS.loaded_chunk_columns()
+    );
 
     App::new()
         .insert_resource(NetworkSettings {
@@ -63,6 +184,8 @@ pub fn run() {
         .insert_resource(WorldRules {
             bounds: WORLD_BOUNDS,
         })
+        .insert_resource(interest)
+        .insert_resource(ServerTelemetry::default())
         .insert_resource(persistence)
         .insert_resource(mcp)
         .insert_resource(bridge)
@@ -93,8 +216,8 @@ fn setup_world(
     let mut layer = LayerBundle::new(ident!("overworld"), &dimensions, &biomes, &server);
     let bounds = rules.bounds;
 
-    for chunk_z in bounds.min_z.div_euclid(16)..=bounds.max_z.div_euclid(16) {
-        for chunk_x in bounds.min_x.div_euclid(16)..=bounds.max_x.div_euclid(16) {
+    for chunk_z in bounds.min_chunk_z()..=bounds.max_chunk_z() {
+        for chunk_x in bounds.min_chunk_x()..=bounds.max_chunk_x() {
             layer
                 .chunk
                 .insert_chunk([chunk_x, chunk_z], UnloadedChunk::new());
@@ -161,10 +284,12 @@ fn init_clients(
             &mut GameMode,
             &mut Inventory,
             &mut IsFlat,
+            &mut ViewDistance,
         ),
         Added<Client>,
     >,
     layers: Query<Entity, (With<ChunkLayer>, With<EntityLayer>)>,
+    interest: Res<InterestConfig>,
 ) {
     for (
         mut client,
@@ -175,6 +300,7 @@ fn init_clients(
         mut game_mode,
         mut inventory,
         mut is_flat,
+        mut view_distance,
     ) in &mut clients
     {
         let layer = layers.single();
@@ -185,12 +311,13 @@ fn init_clients(
         pos.set([0.5, SPAWN_FEET_Y as f64, 0.5]);
         *game_mode = GameMode::Creative;
         is_flat.0 = true;
+        view_distance.set(interest.view_distance_chunks);
         give_hotbar_blocks(&mut inventory);
 
-        client.send_chat_message(
-            "World Loom M6: shared server-backed creative world with local MCP tools and SQLite persistence. Bounds are 128x128 blocks."
-                .into_text(),
-        );
+        client.send_chat_message(format!(
+            "World Loom V2: multiplayer performance/storage telemetry enabled. Bounds are 128x128 blocks; view distance is {} chunks.",
+            interest.view_distance_chunks
+        ));
     }
 }
 
@@ -287,12 +414,16 @@ fn block_state_at(layer: &ChunkLayer, position: BlockPos) -> BlockState {
         .unwrap_or(BlockState::AIR)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mcp_requests(
     mcp: Res<McpRuntime>,
     server: Res<Server>,
     mut layers: Query<&mut ChunkLayer>,
     rules: Res<WorldRules>,
     persistence: Res<PersistenceRuntime>,
+    telemetry: Res<ServerTelemetry>,
+    interest: Res<InterestConfig>,
+    bridge: Res<BridgeRuntime>,
     clients: Query<(&Username, &Position, Option<&Ping>)>,
 ) {
     for _ in 0..MAX_MCP_REQUESTS_PER_TICK {
@@ -302,49 +433,71 @@ fn handle_mcp_requests(
 
         let result = {
             let mut layer = layers.single_mut();
-            handle_mcp_tool(
-                &request,
-                &server,
-                &mut layer,
-                rules.bounds,
-                &persistence,
-                &clients,
-                mcp.addr().to_string(),
-            )
+            let context = McpToolContext {
+                server: &server,
+                bounds: rules.bounds,
+                persistence: &persistence,
+                telemetry: telemetry.snapshot(),
+                interest: &interest,
+                bridge: &bridge,
+                mcp_addr: mcp.addr().to_string(),
+                players: player_list_json(&clients),
+            };
+            handle_mcp_tool(&request, &mut layer, context)
         };
         request.respond(result);
     }
 }
 
+struct McpToolContext<'a> {
+    server: &'a Server,
+    bounds: WorldBounds,
+    persistence: &'a PersistenceRuntime,
+    telemetry: &'a TelemetrySnapshot,
+    interest: &'a InterestConfig,
+    bridge: &'a BridgeRuntime,
+    mcp_addr: String,
+    players: Vec<serde_json::Value>,
+}
+
 fn handle_mcp_tool(
     request: &McpToolRequest,
-    server: &Server,
     layer: &mut ChunkLayer,
-    bounds: WorldBounds,
-    persistence: &PersistenceRuntime,
-    clients: &Query<(&Username, &Position, Option<&Ping>)>,
-    mcp_addr: String,
+    context: McpToolContext<'_>,
 ) -> Result<serde_json::Value, String> {
     match request.name.as_str() {
-        "server_status" => Ok(serde_json::json!({
-            "tick": server.current_tick(),
-            "connected_players": clients.iter().count(),
-            "world_bounds": world_bounds_json(bounds),
-            "database_path": persistence.db_path().display().to_string(),
-            "mcp_endpoint": format!("http://{mcp_addr}/mcp"),
-        })),
+        "server_status" => {
+            let storage = context.persistence.stats_snapshot();
+            let loaded_chunks = layer.chunks().count();
+            Ok(serde_json::json!({
+                "tick": context.server.current_tick(),
+                "connected_players": context.players.len(),
+                "world_bounds": world_bounds_json(context.bounds),
+                "database_path": context.persistence.db_path().display().to_string(),
+                "mcp_endpoint": format!("http://{}/mcp", context.mcp_addr),
+                "performance": performance_json(context.telemetry),
+                "network": network_json(
+                    context.telemetry,
+                    context.interest,
+                    loaded_chunks,
+                    &context.players,
+                ),
+                "storage": storage_json(&storage, context.persistence.db_path()),
+                "bridge": bridge_json(context.bridge),
+            }))
+        }
         "list_players" => Ok(serde_json::json!({
-            "players": player_list_json(clients),
+            "players": context.players,
         })),
-        "get_world_bounds" => Ok(world_bounds_json(bounds)),
+        "get_world_bounds" => Ok(world_bounds_json(context.bounds)),
         "get_block" => {
             let position = required_block_pos(&request.arguments)?;
-            ensure_in_bounds(bounds, position)?;
+            ensure_in_bounds(context.bounds, position)?;
             Ok(block_json(position, block_state_at(layer, position)))
         }
         "snapshot_region" => {
             let region = required_region(&request.arguments, MAX_SNAPSHOT_BLOCKS)?;
-            ensure_region_in_bounds(bounds, region.min, region.max)?;
+            ensure_region_in_bounds(context.bounds, region.min, region.max)?;
             let mut blocks = Vec::new();
             for position in region_positions(region.min, region.max, false) {
                 blocks.push(block_json(position, block_state_at(layer, position)));
@@ -358,12 +511,18 @@ fn handle_mcp_tool(
         }
         "set_block" => {
             let position = required_block_pos(&request.arguments)?;
-            ensure_in_bounds(bounds, position)?;
+            ensure_in_bounds(context.bounds, position)?;
             let block = required_block_state(&request.arguments)?;
             if block == BlockState::AIR {
                 return Err("set_block does not accept air; use remove_block".to_string());
             }
-            set_block_via_world_command(layer, bounds, persistence, position, block)?;
+            set_block_via_world_command(
+                layer,
+                context.bounds,
+                context.persistence,
+                position,
+                block,
+            )?;
             Ok(serde_json::json!({
                 "edited": 1,
                 "block": block_json(position, block_state_at(layer, position)),
@@ -371,8 +530,8 @@ fn handle_mcp_tool(
         }
         "remove_block" => {
             let position = required_block_pos(&request.arguments)?;
-            ensure_in_bounds(bounds, position)?;
-            remove_block_via_world_command(layer, bounds, persistence, position)?;
+            ensure_in_bounds(context.bounds, position)?;
+            remove_block_via_world_command(layer, context.bounds, context.persistence, position)?;
             Ok(serde_json::json!({
                 "edited": 1,
                 "block": block_json(position, block_state_at(layer, position)),
@@ -380,9 +539,16 @@ fn handle_mcp_tool(
         }
         "fill_region" => {
             let region = required_region(&request.arguments, MAX_FILL_BLOCKS)?;
-            ensure_region_in_bounds(bounds, region.min, region.max)?;
+            ensure_region_in_bounds(context.bounds, region.min, region.max)?;
             let block = required_block_state(&request.arguments)?;
-            fill_region_via_world_command(layer, bounds, persistence, region.min, region.max, block)
+            fill_region_via_world_command(
+                layer,
+                context.bounds,
+                context.persistence,
+                region.min,
+                region.max,
+                block,
+            )
         }
         _ => Err(format!("unknown MCP tool `{}`", request.name)),
     }
@@ -546,10 +712,65 @@ fn player_list_json(
         .collect()
 }
 
+fn performance_json(snapshot: &TelemetrySnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "tick": snapshot.tick,
+        "last_mspt": round_ms(snapshot.last_mspt),
+        "avg_mspt": round_ms(snapshot.avg_mspt),
+        "max_mspt": round_ms(snapshot.max_mspt),
+        "window_samples": snapshot.window_samples,
+        "telemetry_interval_ticks": TELEMETRY_INTERVAL_TICKS,
+    })
+}
+
+fn network_json(
+    snapshot: &TelemetrySnapshot,
+    interest: &InterestConfig,
+    loaded_chunks: usize,
+    players: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "players": players,
+        "view_distance_chunks": interest.view_distance_chunks,
+        "interest_chunks_per_player": interest_chunk_capacity(interest.view_distance_chunks),
+        "loaded_chunks": loaded_chunks,
+        "world_chunk_columns": snapshot.world_chunk_columns,
+    })
+}
+
+fn storage_json(stats: &PersistenceStatsSnapshot, db_path: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "backend": stats.storage_backend,
+        "schema_version": stats.schema_version,
+        "save_format_version": stats.save_format_version,
+        "database_path": db_path.display().to_string(),
+        "loaded_overrides": stats.loaded_overrides,
+        "pending_edits": stats.pending_edits,
+        "flushed_edits": stats.flushed_edits,
+        "flush_batches": stats.flush_batches,
+        "failed_flushes": stats.failed_flushes,
+    })
+}
+
+fn bridge_json(bridge: &BridgeRuntime) -> serde_json::Value {
+    let config = bridge.config();
+    serde_json::json!({
+        "endpoint": format!("http://{}", bridge.addr()),
+        "tcp_read_buffer_bytes": config.tcp_read_buffer_bytes,
+        "ws_queue_capacity": config.ws_queue_capacity,
+        "max_pending_connections": config.max_pending_connections,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn update_debug_telemetry(
     server: Res<Server>,
     mut player_list: ResMut<PlayerList>,
     mut clients: Query<(&mut Client, &Username, &Ping)>,
+    layers: Query<&ChunkLayer>,
+    interest: Res<InterestConfig>,
+    rules: Res<WorldRules>,
+    mut telemetry: ResMut<ServerTelemetry>,
     mut last_report: Local<Option<TelemetrySample>>,
 ) {
     let tick = server.current_tick();
@@ -581,9 +802,20 @@ fn update_debug_telemetry(
         });
     }
 
-    let header = telemetry_header(tick, players.len());
-    let footer = telemetry_footer(tick_delta_ms, &players);
-    let action_bar = telemetry_action_bar(tick, tick_delta_ms, players.len());
+    let loaded_chunks = layers.single().chunks().count();
+    telemetry.record(
+        tick,
+        tick_delta_ms,
+        players,
+        loaded_chunks,
+        interest.view_distance_chunks,
+        rules.bounds.loaded_chunk_columns(),
+    );
+    let snapshot = telemetry.snapshot();
+
+    let header = telemetry_header(snapshot);
+    let footer = telemetry_footer(snapshot);
+    let action_bar = telemetry_action_bar(snapshot);
 
     player_list.set_header(header);
     player_list.set_footer(footer);
@@ -594,27 +826,43 @@ fn update_debug_telemetry(
 
     println!(
         "[world-loom] tick={} tick_delta_ms={:.2} players={} {}",
-        tick,
-        tick_delta_ms,
-        players.len(),
-        format_player_pings(&players)
+        snapshot.tick,
+        snapshot.last_mspt,
+        snapshot.players.len(),
+        format_player_pings(&snapshot.players)
     );
 }
 
-fn telemetry_header(tick: i64, player_count: usize) -> String {
-    format!("World Loom M6 | tick {tick} | players {player_count}")
-}
-
-fn telemetry_footer(tick_delta_ms: f64, players: &[PlayerTelemetry]) -> String {
+fn telemetry_header(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "tick delta {:.2}ms | {}",
-        tick_delta_ms,
-        format_player_pings(players)
+        "World Loom V2 | tick {} | players {} | view {} chunks",
+        snapshot.tick,
+        snapshot.players.len(),
+        snapshot.view_distance_chunks
     )
 }
 
-fn telemetry_action_bar(tick: i64, tick_delta_ms: f64, player_count: usize) -> String {
-    format!("M6 tick {tick} | {tick_delta_ms:.2}ms | {player_count} players")
+fn telemetry_footer(snapshot: &TelemetrySnapshot) -> String {
+    format!(
+        "MSPT last {:.2} avg {:.2} max {:.2} | chunks {}/{} | {}",
+        snapshot.last_mspt,
+        snapshot.avg_mspt,
+        snapshot.max_mspt,
+        snapshot.loaded_chunks,
+        snapshot.world_chunk_columns,
+        format_player_pings(&snapshot.players)
+    )
+}
+
+fn telemetry_action_bar(snapshot: &TelemetrySnapshot) -> String {
+    format!(
+        "V2 tick {} | MSPT {:.2}/{:.2} avg | {} players | {} chunks",
+        snapshot.tick,
+        snapshot.last_mspt,
+        snapshot.avg_mspt,
+        snapshot.players.len(),
+        snapshot.loaded_chunks
+    )
 }
 
 fn format_player_pings(players: &[PlayerTelemetry]) -> String {
@@ -636,13 +884,36 @@ fn format_player_pings(players: &[PlayerTelemetry]) -> String {
         .join(", ")
 }
 
+fn average_mspt(samples: &VecDeque<f64>) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    samples.iter().sum::<f64>() / samples.len() as f64
+}
+
+fn round_ms(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn interest_chunk_capacity(view_distance_chunks: u8) -> usize {
+    let diameter = usize::from(view_distance_chunks) * 2 + 1;
+    diameter * diameter
+}
+
+fn bounded_view_distance(raw: Option<&str>) -> u8 {
+    raw.and_then(|value| value.trim().parse::<u8>().ok())
+        .unwrap_or(DEFAULT_VIEW_DISTANCE_CHUNKS)
+        .clamp(2, MAX_VIEW_DISTANCE_CHUNKS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn telemetry_formats_player_count_and_ping() {
-        let players = [
+        let players = vec![
             PlayerTelemetry {
                 username: "loom_a".to_string(),
                 ping_ms: 42,
@@ -652,18 +923,39 @@ mod tests {
                 ping_ms: -1,
             },
         ];
+        let snapshot = TelemetrySnapshot {
+            tick: 80,
+            last_mspt: 3.25,
+            avg_mspt: 3.0,
+            max_mspt: 4.5,
+            players,
+            loaded_chunks: 64,
+            view_distance_chunks: 6,
+            interest_chunks_per_player: interest_chunk_capacity(6),
+            world_chunk_columns: 64,
+            window_samples: 2,
+        };
 
         assert_eq!(
-            telemetry_header(80, players.len()),
-            "World Loom M6 | tick 80 | players 2"
+            telemetry_header(&snapshot),
+            "World Loom V2 | tick 80 | players 2 | view 6 chunks"
         );
         assert_eq!(
-            telemetry_footer(3.25, &players),
-            "tick delta 3.25ms | loom_a=42ms, loom_b=pending"
+            telemetry_footer(&snapshot),
+            "MSPT last 3.25 avg 3.00 max 4.50 | chunks 64/64 | loom_a=42ms, loom_b=pending"
         );
         assert_eq!(
-            telemetry_action_bar(80, 3.25, players.len()),
-            "M6 tick 80 | 3.25ms | 2 players"
+            telemetry_action_bar(&snapshot),
+            "V2 tick 80 | MSPT 3.25/3.00 avg | 2 players | 64 chunks"
         );
+    }
+
+    #[test]
+    fn view_distance_defaults_and_clamps() {
+        assert_eq!(bounded_view_distance(None), DEFAULT_VIEW_DISTANCE_CHUNKS);
+        assert_eq!(bounded_view_distance(Some("1")), 2);
+        assert_eq!(bounded_view_distance(Some("64")), MAX_VIEW_DISTANCE_CHUNKS);
+        assert_eq!(bounded_view_distance(Some("8")), 8);
+        assert_eq!(interest_chunk_capacity(2), 25);
     }
 }

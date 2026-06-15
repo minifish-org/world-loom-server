@@ -1,5 +1,6 @@
 /target/
 data/
+backups/
 *.sqlite
 *.sqlite3
 *.db

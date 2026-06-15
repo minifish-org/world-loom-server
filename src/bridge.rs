@@ -36,11 +36,23 @@ use valence::prelude::Resource;
 
 pub const BRIDGE_ADDR_ENV: &str = "WORLD_LOOM_BRIDGE_ADDR";
 pub const BRIDGE_ALLOWED_ORIGINS_ENV: &str = "WORLD_LOOM_ALLOWED_ORIGINS";
+pub const BRIDGE_TCP_READ_BUFFER_BYTES_ENV: &str = "WORLD_LOOM_BRIDGE_TCP_READ_BUFFER_BYTES";
+pub const BRIDGE_WS_QUEUE_CAPACITY_ENV: &str = "WORLD_LOOM_BRIDGE_WS_QUEUE_CAPACITY";
+pub const BRIDGE_MAX_PENDING_CONNECTIONS_ENV: &str = "WORLD_LOOM_BRIDGE_MAX_PENDING_CONNECTIONS";
 pub const DEFAULT_BRIDGE_ADDR: &str = "127.0.0.1:18081";
 
 const API_ROOT: &str = "/api/vm/net";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LOCAL_ORIGINS: &[&str] = &["http://localhost:3000", "http://127.0.0.1:3000"];
+const DEFAULT_TCP_READ_BUFFER_BYTES: usize = 16 * 1024;
+const MIN_TCP_READ_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_WS_QUEUE_CAPACITY: usize = 1024;
+const MIN_WS_QUEUE_CAPACITY: usize = 16;
+const MAX_WS_QUEUE_CAPACITY: usize = 8192;
+const DEFAULT_MAX_PENDING_CONNECTIONS: usize = 128;
+const MIN_MAX_PENDING_CONNECTIONS: usize = 1;
+const MAX_MAX_PENDING_CONNECTIONS: usize = 1024;
 
 #[derive(Debug)]
 pub enum BridgeError {
@@ -65,6 +77,7 @@ impl std::error::Error for BridgeError {}
 
 pub struct BridgeRuntime {
     addr: SocketAddr,
+    config: BridgeConfig,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -78,14 +91,23 @@ impl BridgeRuntime {
         let addr = resolve_addr(&requested_addr)
             .ok_or_else(|| BridgeError::InvalidAddress(requested_addr.clone()))?;
         let allowed_origins = AllowedOrigins::from_env();
-        Self::start(addr, allowed_origins)
+        let config = BridgeConfig::from_env();
+        Self::start(addr, allowed_origins, config)
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    fn start(addr: SocketAddr, allowed_origins: AllowedOrigins) -> Result<Self, BridgeError> {
+    pub fn config(&self) -> BridgeConfig {
+        self.config
+    }
+
+    fn start(
+        addr: SocketAddr,
+        allowed_origins: AllowedOrigins,
+        config: BridgeConfig,
+    ) -> Result<Self, BridgeError> {
         let listener = std::net::TcpListener::bind(addr).map_err(BridgeError::Bind)?;
         listener.set_nonblocking(true).map_err(BridgeError::Bind)?;
         let bound_addr = listener.local_addr().map_err(BridgeError::Bind)?;
@@ -116,7 +138,7 @@ impl BridgeRuntime {
                             return;
                         }
                     };
-                    let state = BridgeState::new(allowed_origins);
+                    let state = BridgeState::new(allowed_origins, config);
                     let app = Router::new()
                         .route(
                             &format!("{API_ROOT}/connect"),
@@ -143,6 +165,7 @@ impl BridgeRuntime {
         match startup_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => Ok(Self {
                 addr: bound_addr,
+                config,
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 thread: Mutex::new(Some(thread)),
             }),
@@ -170,19 +193,53 @@ impl Drop for BridgeRuntime {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeConfig {
+    pub tcp_read_buffer_bytes: usize,
+    pub ws_queue_capacity: usize,
+    pub max_pending_connections: usize,
+}
+
+impl BridgeConfig {
+    fn from_env() -> Self {
+        Self {
+            tcp_read_buffer_bytes: bounded_env_usize(
+                BRIDGE_TCP_READ_BUFFER_BYTES_ENV,
+                DEFAULT_TCP_READ_BUFFER_BYTES,
+                MIN_TCP_READ_BUFFER_BYTES,
+                MAX_TCP_READ_BUFFER_BYTES,
+            ),
+            ws_queue_capacity: bounded_env_usize(
+                BRIDGE_WS_QUEUE_CAPACITY_ENV,
+                DEFAULT_WS_QUEUE_CAPACITY,
+                MIN_WS_QUEUE_CAPACITY,
+                MAX_WS_QUEUE_CAPACITY,
+            ),
+            max_pending_connections: bounded_env_usize(
+                BRIDGE_MAX_PENDING_CONNECTIONS_ENV,
+                DEFAULT_MAX_PENDING_CONNECTIONS,
+                MIN_MAX_PENDING_CONNECTIONS,
+                MAX_MAX_PENDING_CONNECTIONS,
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BridgeState {
     pending_connections: Arc<Mutex<HashMap<String, TcpStream>>>,
     allowed_origins: Arc<AllowedOrigins>,
     connect_timeout: Duration,
+    config: BridgeConfig,
 }
 
 impl BridgeState {
-    fn new(allowed_origins: AllowedOrigins) -> Self {
+    fn new(allowed_origins: AllowedOrigins, config: BridgeConfig) -> Self {
         Self {
             pending_connections: Arc::new(Mutex::new(HashMap::new())),
             allowed_origins: Arc::new(allowed_origins),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            config,
         }
     }
 
@@ -208,6 +265,19 @@ impl BridgeState {
             })
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static("null"))
+    }
+
+    fn insert_pending_connection(&self, token: String, stream: TcpStream) -> Result<(), TcpStream> {
+        let mut pending = self
+            .pending_connections
+            .lock()
+            .expect("bridge pending connection mutex");
+        if pending.len() >= self.config.max_pending_connections {
+            return Err(stream);
+        }
+
+        pending.insert(token, stream);
+        Ok(())
     }
 }
 
@@ -386,11 +456,23 @@ async fn connect_tcp(
     };
 
     let token = Uuid::new_v4().simple().to_string();
-    state
-        .pending_connections
-        .lock()
-        .expect("bridge pending connection mutex")
-        .insert(token.clone(), stream);
+    if state
+        .insert_pending_connection(token.clone(), stream)
+        .is_err()
+    {
+        return with_cors(
+            headers,
+            &state,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: 503,
+                    error: "too many pending bridge connections".into(),
+                }),
+            )
+                .into_response(),
+        );
+    }
 
     with_cors(
         headers,
@@ -430,7 +512,8 @@ async fn socket_ws(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    ws.on_upgrade(move |socket| proxy_socket(socket, stream))
+    let config = state.config;
+    ws.on_upgrade(move |socket| proxy_socket(socket, stream, config))
 }
 
 async fn ping_ws(
@@ -456,10 +539,10 @@ async fn handle_ping_socket(socket: WebSocket) {
     }
 }
 
-async fn proxy_socket(socket: WebSocket, stream: TcpStream) {
+async fn proxy_socket(socket: WebSocket, stream: TcpStream, config: BridgeConfig) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (mut tcp_reader, mut tcp_writer) = stream.into_split();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(config.ws_queue_capacity);
 
     let ws_writer = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
@@ -471,29 +554,34 @@ async fn proxy_socket(socket: WebSocket, stream: TcpStream) {
 
     let tcp_to_ws_tx = outbound_tx.clone();
     let mut tcp_reader_task = tokio::spawn(async move {
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = vec![0_u8; config.tcp_read_buffer_bytes];
         loop {
             match tcp_reader.read(&mut buffer).await {
                 Ok(0) => {
-                    let _ = tcp_to_ws_tx.send(Message::Text(
-                        "proxy-shutdown:Minecraft server closed the connection.".into(),
-                    ));
-                    let _ = tcp_to_ws_tx.send(Message::Close(None));
+                    let _ = tcp_to_ws_tx
+                        .send(Message::Text(
+                            "proxy-shutdown:Minecraft server closed the connection.".into(),
+                        ))
+                        .await;
+                    let _ = tcp_to_ws_tx.send(Message::Close(None)).await;
                     break;
                 }
                 Ok(read) => {
                     if tcp_to_ws_tx
                         .send(Message::Binary(buffer[..read].to_vec()))
+                        .await
                         .is_err()
                     {
                         break;
                     }
                 }
                 Err(error) => {
-                    let _ = tcp_to_ws_tx.send(Message::Text(format!(
-                        "proxy-shutdown:Minecraft server connection failed: {error}"
-                    )));
-                    let _ = tcp_to_ws_tx.send(Message::Close(None));
+                    let _ = tcp_to_ws_tx
+                        .send(Message::Text(format!(
+                            "proxy-shutdown:Minecraft server connection failed: {error}"
+                        )))
+                        .await;
+                    let _ = tcp_to_ws_tx.send(Message::Close(None)).await;
                     break;
                 }
             }
@@ -511,7 +599,7 @@ async fn proxy_socket(socket: WebSocket, stream: TcpStream) {
                 }
                 Ok(Message::Text(text)) => {
                     if let Some(id) = text.strip_prefix("ping:") {
-                        let _ = ws_to_tcp_tx.send(Message::Text(format!("pong:{id}")));
+                        let _ = ws_to_tcp_tx.send(Message::Text(format!("pong:{id}"))).await;
                     } else if tcp_writer.write_all(text.as_bytes()).await.is_err() {
                         break;
                     }
@@ -541,6 +629,16 @@ async fn proxy_socket(socket: WebSocket, stream: TcpStream) {
 
 fn resolve_addr(address: &str) -> Option<SocketAddr> {
     address.to_socket_addrs().ok()?.next()
+}
+
+fn bounded_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    bounded_env_value(env::var(name).ok().as_deref(), default, min, max)
+}
+
+fn bounded_env_value(raw: Option<&str>, default: usize, min: usize, max: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
 }
 
 fn current_millis() -> u128 {
@@ -604,6 +702,35 @@ mod tests {
         assert_eq!(
             resolve_addr(DEFAULT_BRIDGE_ADDR).expect("default bridge address"),
             "127.0.0.1:18081".parse().expect("socket addr")
+        );
+    }
+
+    #[test]
+    fn bridge_config_env_values_are_bounded() {
+        assert_eq!(
+            bounded_env_value(Some("1"), 100, 10, 200),
+            10,
+            "too-small values clamp up"
+        );
+        assert_eq!(
+            bounded_env_value(Some("500"), 100, 10, 200),
+            200,
+            "too-large values clamp down"
+        );
+        assert_eq!(
+            bounded_env_value(Some("125"), 100, 10, 200),
+            125,
+            "in-range values pass through"
+        );
+        assert_eq!(
+            bounded_env_value(Some("not-a-number"), 100, 10, 200),
+            100,
+            "invalid values fall back to default"
+        );
+        assert_eq!(
+            bounded_env_value(None, 100, 10, 200),
+            100,
+            "missing values fall back to default"
         );
     }
 }

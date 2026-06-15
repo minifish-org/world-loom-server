@@ -50,6 +50,28 @@ impl WorldBounds {
             && (self.min_y..=self.max_y).contains(&position.y)
             && (self.min_z..=self.max_z).contains(&position.z)
     }
+
+    pub fn min_chunk_x(self) -> i32 {
+        self.min_x.div_euclid(16)
+    }
+
+    pub fn max_chunk_x(self) -> i32 {
+        self.max_x.div_euclid(16)
+    }
+
+    pub fn min_chunk_z(self) -> i32 {
+        self.min_z.div_euclid(16)
+    }
+
+    pub fn max_chunk_z(self) -> i32 {
+        self.max_z.div_euclid(16)
+    }
+
+    pub fn loaded_chunk_columns(self) -> usize {
+        let width = (self.max_chunk_x() - self.min_chunk_x() + 1).max(0) as usize;
+        let depth = (self.max_chunk_z() - self.min_chunk_z() + 1).max(0) as usize;
+        width * depth
+    }
 }
 
 pub fn base_block_state_at(bounds: WorldBounds, position: BlockPos) -> Option<BlockState> {
