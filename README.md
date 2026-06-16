@@ -2,13 +2,13 @@
 
 This repository owns the future Rust authoritative server for World Loom Online.
 
-M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits to SQLite and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
+M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. V3 adds chunk lifecycle and region-file chunk storage foundations. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
 
 ## What M2 Provides
 
 - Valence server using Minecraft protocol 1.20.1.
 - Offline auth mode for local development.
-- Bounded 128x128 superflat world centered at `0,0`.
+- Bounded superflat world centered at `0,0`.
 - Players spawn at the center in creative mode.
 - Hotbar slots contain basic building blocks.
 - Player block placement and removal route through `WorldCommand`.
@@ -67,6 +67,18 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 - SQLite writer queue stats in MCP `server_status`.
 - Online-safe backup script with a JSON manifest.
 
+## What V3 Adds
+
+- Bounded world expands to 512x512 horizontal blocks, centered at `0,0`.
+- The server no longer generates or inserts every chunk at startup.
+- Chunks load/generate around player interest and unload when no longer needed.
+- MCP reads/edits load required chunks before accessing live world state.
+- `WorldStorage` now exposes chunk-oriented operations.
+- `RegionChunkStorage` stores edited chunk bulk data under `data/regions` by default.
+- `HybridRegionStorage` keeps SQLite for metadata, command log, dirty chunk index, backup manifest, and legacy SQLite delta fallback.
+- Successful edits still route through `WorldCommand`, then enqueue persistence work.
+- Backup and clear-save scripts cover both SQLite metadata and region chunk files.
+
 ## Run
 
 ```sh
@@ -75,16 +87,24 @@ cargo run
 
 The server listens on Valence's default `0.0.0.0:25565`.
 
-By default, M5 saves to:
+By default, V3 stores SQLite metadata at:
 
 ```text
 data/world-loom.sqlite3
 ```
 
-Use `WORLD_LOOM_DB_PATH` to override the save path for local tests:
+and region chunk files at:
+
+```text
+data/regions
+```
+
+Use `WORLD_LOOM_DB_PATH` and `WORLD_LOOM_REGION_DIR` to override these paths for local tests:
 
 ```sh
-WORLD_LOOM_DB_PATH=/tmp/world-loom-test.sqlite3 cargo run
+WORLD_LOOM_DB_PATH=/tmp/world-loom-test.sqlite3 \
+WORLD_LOOM_REGION_DIR=/tmp/world-loom-test-regions \
+  cargo run
 ```
 
 The MCP endpoint defaults to:
@@ -183,13 +203,14 @@ The stack-level smoke tests start the local repos and run browser verification:
 ../scripts/smoke-m4-dual-client.sh
 ../scripts/smoke-m5-persistence.sh
 ../scripts/smoke-m6-mcp.sh
+../scripts/smoke-v3-storage.sh
 ```
 
 ## MCP Tools
 
 Read-only:
 
-- `server_status`: tick, player count, bounds, database path, MCP endpoint, MSPT telemetry, chunk interest stats, bridge backpressure config, SQLite schema/save format versions, and writer queue stats.
+- `server_status`: tick, player count, bounds, database path, region path, MCP endpoint, MSPT telemetry, chunk interest/lifecycle stats, bridge backpressure config, SQLite schema/save format versions, dirty chunk count, and writer queue stats.
 - `list_players`: connected player names, positions, and ping.
 - `get_world_bounds`: bounded world coordinates.
 - `get_block`: one live block.
@@ -235,17 +256,31 @@ All edit tools use `WorldCommand`, so bounds, spawn protection, foundation prote
 - final `block_state_raw`
 - `recorded_at`
 
+`dirty_chunks`
+
+- dirty chunk index keyed by chunk x/z
+- dirty count and last dirty/flush timestamps
+
+`backup_manifest`
+
+- SQLite source/backup paths
+- region source/backup paths
+- schema/save format versions
+- creation timestamp
+
 `block_state_raw` is Valence `BlockState::to_raw()` for the current Minecraft protocol version.
+
+`block_overrides` remains in the schema for legacy V1/V2 SQLite delta fallback. V3 chunk bulk writes go to region files instead of adding new `block_overrides` rows.
 
 ## Reset / Backup
 
-Back up the local save with the V2 backup script:
+Back up the local save with the V3 backup script:
 
 ```sh
 ./scripts/backup-save.sh
 ```
 
-By default this writes an ignored `backups/world-loom-*.sqlite3` file plus a JSON manifest. Set `WORLD_LOOM_DB_PATH` and `WORLD_LOOM_BACKUP_DIR` to override the source and destination.
+By default this writes an ignored `backups/world-loom-*.sqlite3` file, a copied `backups/world-loom-*-regions` directory, and a JSON manifest. Set `WORLD_LOOM_DB_PATH`, `WORLD_LOOM_REGION_DIR`, and `WORLD_LOOM_BACKUP_DIR` to override the source and destination.
 
 Clear the default local save:
 
@@ -253,18 +288,18 @@ Clear the default local save:
 ./scripts/clear-save.sh
 ```
 
-The clear script deletes the DB plus SQLite `-wal`/`-shm` sidecars and refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
+The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and region directory. It refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
 
-## Not In V2
+## Not In V3
 
 - No complex MCP permission system.
 - No public Cloudflare Worker proxy.
 - No client UI rewrite.
 - No new gameplay systems.
-- No infinite world persistence.
+- No true infinite world yet.
 - No Valence core changes.
-- No Anvil/region storage implementation.
+- No direct Minecraft Anvil import/export yet.
 
 ## Next Direction
 
-After V2, the next practical hardening work is production process management, deeper storage evaluation, and later MCP authorization.
+After V3, the next practical work is V4 family-play hardening: production process management, MCP authorization/audit UX, simple admin backup/restore operations, and the first World Loom-specific visible behavior.

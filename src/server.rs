@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::time::Instant;
 
@@ -13,10 +13,10 @@ use crate::mcp::{
     block_json, block_state_name, required_block_pos, required_block_state, required_region,
     McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS,
 };
-use crate::persistence::{PersistenceRuntime, PersistenceStatsSnapshot, SavedBlockOverride};
+use crate::persistence::{PersistenceRuntime, PersistenceStatsSnapshot, StoredChunk};
 use crate::world_command::{
-    execute_world_command, CommandContext, WorldBounds, WorldCommand, GROUND_Y, HOTBAR_BLOCKS,
-    SPAWN_FEET_Y, WORLD_BOUNDS,
+    execute_world_command, ChunkColumn, CommandContext, WorldBounds, WorldCommand, GROUND_Y,
+    HOTBAR_BLOCKS, SPAWN_FEET_Y, WORLD_BOUNDS,
 };
 
 const TELEMETRY_INTERVAL_TICKS: i64 = 20;
@@ -25,10 +25,46 @@ const MAX_MCP_REQUESTS_PER_TICK: usize = 64;
 pub const VIEW_DISTANCE_ENV: &str = "WORLD_LOOM_VIEW_DISTANCE_CHUNKS";
 const DEFAULT_VIEW_DISTANCE_CHUNKS: u8 = 6;
 const MAX_VIEW_DISTANCE_CHUNKS: u8 = 12;
+const CHUNK_LOAD_MARGIN: i32 = 1;
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct WorldRules {
     bounds: WorldBounds,
+}
+
+#[derive(Resource, Debug, Default)]
+struct ChunkLifecycle {
+    loaded: BTreeSet<ChunkColumn>,
+    generated_chunks: u64,
+    storage_loaded_chunks: u64,
+    unloaded_chunks: u64,
+    dirty_chunks_marked: u64,
+}
+
+impl ChunkLifecycle {
+    fn mark_loaded_generated(&mut self, column: ChunkColumn) {
+        if self.loaded.insert(column) {
+            self.generated_chunks += 1;
+        }
+    }
+
+    fn mark_loaded_from_storage(&mut self, column: ChunkColumn) {
+        if self.loaded.insert(column) {
+            self.generated_chunks += 1;
+            self.storage_loaded_chunks += 1;
+        }
+    }
+
+    fn mark_unloaded(&mut self, column: ChunkColumn) {
+        if self.loaded.remove(&column) {
+            self.unloaded_chunks += 1;
+        }
+    }
+
+    fn mark_dirty(&mut self, column: ChunkColumn) {
+        self.dirty_chunks_marked += 1;
+        self.loaded.insert(column);
+    }
 }
 
 #[derive(Resource, Debug, Clone, Copy)]
@@ -146,12 +182,16 @@ pub fn run() {
         .unwrap_or_else(|err| panic!("failed to initialize SQLite persistence: {err}"));
     let persistence_stats = persistence.stats_snapshot();
     println!(
-        "[world-loom] storage={} schema_version={} save_format_version={} path={} loaded_block_overrides={}",
+        "[world-loom] storage={} schema_version={} save_format_version={} path={} legacy_block_overrides={}",
         persistence_stats.storage_backend,
         persistence_stats.schema_version,
         persistence_stats.save_format_version,
         persistence.db_path().display(),
-        persistence.loaded_overrides().len()
+        persistence.loaded_legacy_overrides()
+    );
+    println!(
+        "[world-loom] region chunk path={}",
+        persistence.region_dir().display()
     );
     let mcp = McpRuntime::start_default()
         .unwrap_or_else(|err| panic!("failed to start local MCP server: {err}"));
@@ -185,6 +225,7 @@ pub fn run() {
             bounds: WORLD_BOUNDS,
         })
         .insert_resource(interest)
+        .insert_resource(ChunkLifecycle::default())
         .insert_resource(ServerTelemetry::default())
         .insert_resource(persistence)
         .insert_resource(mcp)
@@ -195,6 +236,7 @@ pub fn run() {
             Update,
             (
                 init_clients,
+                manage_world_chunks,
                 despawn_disconnected_clients,
                 handle_player_digging,
                 handle_player_placement,
@@ -210,66 +252,9 @@ fn setup_world(
     server: Res<Server>,
     dimensions: Res<DimensionTypeRegistry>,
     biomes: Res<BiomeRegistry>,
-    rules: Res<WorldRules>,
-    persistence: Res<PersistenceRuntime>,
 ) {
-    let mut layer = LayerBundle::new(ident!("overworld"), &dimensions, &biomes, &server);
-    let bounds = rules.bounds;
-
-    for chunk_z in bounds.min_chunk_z()..=bounds.max_chunk_z() {
-        for chunk_x in bounds.min_chunk_x()..=bounds.max_chunk_x() {
-            layer
-                .chunk
-                .insert_chunk([chunk_x, chunk_z], UnloadedChunk::new());
-        }
-    }
-
-    for z in bounds.min_z..=bounds.max_z {
-        for x in bounds.min_x..=bounds.max_x {
-            layer
-                .chunk
-                .set_block([x, GROUND_Y - 4, z], BlockState::BEDROCK);
-            layer
-                .chunk
-                .set_block([x, GROUND_Y - 3, z], BlockState::STONE);
-            layer
-                .chunk
-                .set_block([x, GROUND_Y - 2, z], BlockState::DIRT);
-            layer
-                .chunk
-                .set_block([x, GROUND_Y - 1, z], BlockState::DIRT);
-            layer
-                .chunk
-                .set_block([x, GROUND_Y, z], BlockState::GRASS_BLOCK);
-        }
-    }
-
-    let restored = apply_saved_block_overrides(&mut layer.chunk, persistence.loaded_overrides());
-    if restored > 0 {
-        println!(
-            "[world-loom] restored {restored} saved block overrides from {}",
-            persistence.db_path().display()
-        );
-    }
-
+    let layer = LayerBundle::new(ident!("overworld"), &dimensions, &biomes, &server);
     commands.spawn(layer);
-}
-
-fn apply_saved_block_overrides(layer: &mut ChunkLayer, overrides: &[SavedBlockOverride]) -> usize {
-    let mut restored = 0;
-
-    for saved in overrides {
-        if layer.set_block(saved.position, saved.block).is_some() {
-            restored += 1;
-        } else {
-            eprintln!(
-                "[world-loom] skipped saved block override outside loaded chunks: {:?}",
-                saved.position
-            );
-        }
-    }
-
-    restored
 }
 
 #[allow(clippy::type_complexity)]
@@ -315,7 +300,7 @@ fn init_clients(
         give_hotbar_blocks(&mut inventory);
 
         client.send_chat_message(format!(
-            "World Loom V2: multiplayer performance/storage telemetry enabled. Bounds are 128x128 blocks; view distance is {} chunks.",
+            "World Loom V3: chunk lifecycle and region storage enabled. Bounds are 512x512 blocks; view distance is {} chunks.",
             interest.view_distance_chunks
         ));
     }
@@ -327,11 +312,214 @@ fn give_hotbar_blocks(inventory: &mut Inventory) {
     }
 }
 
+fn manage_world_chunks(
+    mut layers: Query<&mut ChunkLayer>,
+    clients: Query<&Position, With<Client>>,
+    rules: Res<WorldRules>,
+    interest: Res<InterestConfig>,
+    persistence: Res<PersistenceRuntime>,
+    mut lifecycle: ResMut<ChunkLifecycle>,
+) {
+    let mut layer = layers.single_mut();
+    if clients.is_empty() {
+        return;
+    }
+
+    let desired = desired_chunks_for_players(&clients, rules.bounds, interest.view_distance_chunks);
+
+    for column in &desired {
+        if let Err(err) = load_or_generate_chunk(
+            &mut layer,
+            rules.bounds,
+            &persistence,
+            &mut lifecycle,
+            *column,
+        ) {
+            eprintln!("[world-loom] failed to load chunk {column:?}: {err}");
+        }
+    }
+
+    let loaded_columns = layer
+        .chunks()
+        .map(|(position, _)| ChunkColumn::from_chunk_pos(position))
+        .collect::<Vec<_>>();
+
+    for column in loaded_columns {
+        if !desired.contains(&column) {
+            layer.remove_chunk(column.to_chunk_pos());
+            lifecycle.mark_unloaded(column);
+        }
+    }
+}
+
+fn desired_chunks_for_players(
+    clients: &Query<&Position, With<Client>>,
+    bounds: WorldBounds,
+    view_distance_chunks: u8,
+) -> BTreeSet<ChunkColumn> {
+    let radius = i32::from(view_distance_chunks) + CHUNK_LOAD_MARGIN;
+    let mut desired = BTreeSet::new();
+
+    for position in clients.iter() {
+        let center = ChunkColumn::from_chunk_pos(position.to_chunk_pos());
+        for z in center.z - radius..=center.z + radius {
+            for x in center.x - radius..=center.x + radius {
+                let column = ChunkColumn::new(x, z);
+                if bounds.contains_chunk(column) {
+                    desired.insert(column);
+                }
+            }
+        }
+    }
+
+    desired
+}
+
+fn load_or_generate_chunk(
+    layer: &mut ChunkLayer,
+    bounds: WorldBounds,
+    persistence: &PersistenceRuntime,
+    lifecycle: &mut ChunkLifecycle,
+    column: ChunkColumn,
+) -> Result<(), String> {
+    if !bounds.contains_chunk(column) {
+        return Ok(());
+    }
+
+    if layer.chunk(column.to_chunk_pos()).is_some() {
+        lifecycle.loaded.insert(column);
+        return Ok(());
+    }
+
+    layer.insert_chunk(column.to_chunk_pos(), UnloadedChunk::new());
+    generate_base_chunk(layer, bounds, column);
+
+    let stored = persistence
+        .load_chunk(column)
+        .map_err(|err| format!("load chunk storage failed: {err}"))?;
+    let restored = if let Some(stored) = stored {
+        apply_stored_chunk(layer, bounds, &stored)
+    } else {
+        0
+    };
+
+    if restored > 0 {
+        lifecycle.mark_loaded_from_storage(column);
+    } else {
+        lifecycle.mark_loaded_generated(column);
+    }
+
+    Ok(())
+}
+
+fn generate_base_chunk(layer: &mut ChunkLayer, bounds: WorldBounds, column: ChunkColumn) {
+    let min_x = (column.x * 16).max(bounds.min_x);
+    let max_x = (column.x * 16 + 15).min(bounds.max_x);
+    let min_z = (column.z * 16).max(bounds.min_z);
+    let max_z = (column.z * 16 + 15).min(bounds.max_z);
+
+    for z in min_z..=max_z {
+        for x in min_x..=max_x {
+            layer.set_block([x, GROUND_Y - 4, z], BlockState::BEDROCK);
+            layer.set_block([x, GROUND_Y - 3, z], BlockState::STONE);
+            layer.set_block([x, GROUND_Y - 2, z], BlockState::DIRT);
+            layer.set_block([x, GROUND_Y - 1, z], BlockState::DIRT);
+            layer.set_block([x, GROUND_Y, z], BlockState::GRASS_BLOCK);
+        }
+    }
+}
+
+fn apply_stored_chunk(layer: &mut ChunkLayer, bounds: WorldBounds, stored: &StoredChunk) -> usize {
+    let mut restored = 0;
+
+    for saved in &stored.blocks {
+        if !bounds.contains(saved.position) {
+            eprintln!(
+                "[world-loom] skipped saved block outside bounds: {:?}",
+                saved.position
+            );
+            continue;
+        }
+
+        if layer.set_block(saved.position, saved.block).is_some() {
+            restored += 1;
+        }
+    }
+
+    restored
+}
+
+fn ensure_chunk_loaded_for_position(
+    layer: &mut ChunkLayer,
+    bounds: WorldBounds,
+    persistence: &PersistenceRuntime,
+    lifecycle: &mut ChunkLifecycle,
+    position: BlockPos,
+) -> Result<(), String> {
+    load_or_generate_chunk(
+        layer,
+        bounds,
+        persistence,
+        lifecycle,
+        ChunkColumn::from_block_pos(position),
+    )
+}
+
+fn ensure_neighbor_chunks_loaded(
+    layer: &mut ChunkLayer,
+    bounds: WorldBounds,
+    persistence: &PersistenceRuntime,
+    lifecycle: &mut ChunkLifecycle,
+    position: BlockPos,
+) -> Result<(), String> {
+    for position in [
+        position,
+        BlockPos::new(position.x, position.y - 1, position.z),
+        BlockPos::new(position.x, position.y + 1, position.z),
+        BlockPos::new(position.x - 1, position.y, position.z),
+        BlockPos::new(position.x + 1, position.y, position.z),
+        BlockPos::new(position.x, position.y, position.z - 1),
+        BlockPos::new(position.x, position.y, position.z + 1),
+    ] {
+        if bounds.contains(position) {
+            ensure_chunk_loaded_for_position(layer, bounds, persistence, lifecycle, position)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_region_chunks_loaded(
+    layer: &mut ChunkLayer,
+    bounds: WorldBounds,
+    persistence: &PersistenceRuntime,
+    lifecycle: &mut ChunkLifecycle,
+    min: BlockPos,
+    max: BlockPos,
+) -> Result<(), String> {
+    let min_column = ChunkColumn::from_block_pos(min);
+    let max_column = ChunkColumn::from_block_pos(max);
+    for z in min_column.z..=max_column.z {
+        for x in min_column.x..=max_column.x {
+            load_or_generate_chunk(
+                layer,
+                bounds,
+                persistence,
+                lifecycle,
+                ChunkColumn::new(x, z),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_player_digging(
     mut clients: Query<(&GameMode, &mut Client)>,
     mut layers: Query<&mut ChunkLayer>,
     rules: Res<WorldRules>,
     persistence: Res<PersistenceRuntime>,
+    mut lifecycle: ResMut<ChunkLifecycle>,
     mut events: EventReader<DiggingEvent>,
 ) {
     let mut layer = layers.single_mut();
@@ -351,7 +539,10 @@ fn handle_player_digging(
         let context = CommandContext::for_existing_block(block_state_at(&layer, event.position));
 
         match execute_world_command(&mut layer, rules.bounds, command, context) {
-            Ok(()) => persistence.queue_world_command(command, BlockState::AIR),
+            Ok(()) => {
+                persistence.queue_world_command(command, BlockState::AIR);
+                lifecycle.mark_dirty(ChunkColumn::from_block_pos(event.position));
+            }
             Err(err) => {
                 client.send_chat_message(format!("WorldCommand rejected remove_block: {err}"));
             }
@@ -364,6 +555,7 @@ fn handle_player_placement(
     mut layers: Query<&mut ChunkLayer>,
     rules: Res<WorldRules>,
     persistence: Res<PersistenceRuntime>,
+    mut lifecycle: ResMut<ChunkLifecycle>,
     mut events: EventReader<InteractBlockEvent>,
 ) {
     let mut layer = layers.single_mut();
@@ -399,7 +591,10 @@ fn handle_player_placement(
 
         let final_block = block_kind.to_state();
         match execute_world_command(&mut layer, rules.bounds, command, context) {
-            Ok(()) => persistence.queue_world_command(command, final_block),
+            Ok(()) => {
+                persistence.queue_world_command(command, final_block);
+                lifecycle.mark_dirty(ChunkColumn::from_block_pos(target));
+            }
             Err(err) => {
                 client.send_chat_message(format!("WorldCommand rejected set_block: {err}"));
             }
@@ -424,6 +619,7 @@ fn handle_mcp_requests(
     telemetry: Res<ServerTelemetry>,
     interest: Res<InterestConfig>,
     bridge: Res<BridgeRuntime>,
+    mut lifecycle: ResMut<ChunkLifecycle>,
     clients: Query<(&Username, &Position, Option<&Ping>)>,
 ) {
     for _ in 0..MAX_MCP_REQUESTS_PER_TICK {
@@ -440,6 +636,7 @@ fn handle_mcp_requests(
                 telemetry: telemetry.snapshot(),
                 interest: &interest,
                 bridge: &bridge,
+                lifecycle: &mut lifecycle,
                 mcp_addr: mcp.addr().to_string(),
                 players: player_list_json(&clients),
             };
@@ -456,6 +653,7 @@ struct McpToolContext<'a> {
     telemetry: &'a TelemetrySnapshot,
     interest: &'a InterestConfig,
     bridge: &'a BridgeRuntime,
+    lifecycle: &'a mut ChunkLifecycle,
     mcp_addr: String,
     players: Vec<serde_json::Value>,
 }
@@ -482,7 +680,8 @@ fn handle_mcp_tool(
                     loaded_chunks,
                     &context.players,
                 ),
-                "storage": storage_json(&storage, context.persistence.db_path()),
+                "storage": storage_json(&storage, context.persistence),
+                "chunk_lifecycle": chunk_lifecycle_json(context.lifecycle),
                 "bridge": bridge_json(context.bridge),
             }))
         }
@@ -493,11 +692,26 @@ fn handle_mcp_tool(
         "get_block" => {
             let position = required_block_pos(&request.arguments)?;
             ensure_in_bounds(context.bounds, position)?;
+            ensure_chunk_loaded_for_position(
+                layer,
+                context.bounds,
+                context.persistence,
+                context.lifecycle,
+                position,
+            )?;
             Ok(block_json(position, block_state_at(layer, position)))
         }
         "snapshot_region" => {
             let region = required_region(&request.arguments, MAX_SNAPSHOT_BLOCKS)?;
             ensure_region_in_bounds(context.bounds, region.min, region.max)?;
+            ensure_region_chunks_loaded(
+                layer,
+                context.bounds,
+                context.persistence,
+                context.lifecycle,
+                region.min,
+                region.max,
+            )?;
             let mut blocks = Vec::new();
             for position in region_positions(region.min, region.max, false) {
                 blocks.push(block_json(position, block_state_at(layer, position)));
@@ -512,6 +726,13 @@ fn handle_mcp_tool(
         "set_block" => {
             let position = required_block_pos(&request.arguments)?;
             ensure_in_bounds(context.bounds, position)?;
+            ensure_neighbor_chunks_loaded(
+                layer,
+                context.bounds,
+                context.persistence,
+                context.lifecycle,
+                position,
+            )?;
             let block = required_block_state(&request.arguments)?;
             if block == BlockState::AIR {
                 return Err("set_block does not accept air; use remove_block".to_string());
@@ -523,6 +744,9 @@ fn handle_mcp_tool(
                 position,
                 block,
             )?;
+            context
+                .lifecycle
+                .mark_dirty(ChunkColumn::from_block_pos(position));
             Ok(serde_json::json!({
                 "edited": 1,
                 "block": block_json(position, block_state_at(layer, position)),
@@ -531,7 +755,17 @@ fn handle_mcp_tool(
         "remove_block" => {
             let position = required_block_pos(&request.arguments)?;
             ensure_in_bounds(context.bounds, position)?;
+            ensure_chunk_loaded_for_position(
+                layer,
+                context.bounds,
+                context.persistence,
+                context.lifecycle,
+                position,
+            )?;
             remove_block_via_world_command(layer, context.bounds, context.persistence, position)?;
+            context
+                .lifecycle
+                .mark_dirty(ChunkColumn::from_block_pos(position));
             Ok(serde_json::json!({
                 "edited": 1,
                 "block": block_json(position, block_state_at(layer, position)),
@@ -540,15 +774,29 @@ fn handle_mcp_tool(
         "fill_region" => {
             let region = required_region(&request.arguments, MAX_FILL_BLOCKS)?;
             ensure_region_in_bounds(context.bounds, region.min, region.max)?;
+            ensure_region_chunks_loaded(
+                layer,
+                context.bounds,
+                context.persistence,
+                context.lifecycle,
+                region.min,
+                region.max,
+            )?;
             let block = required_block_state(&request.arguments)?;
-            fill_region_via_world_command(
+            let result = fill_region_via_world_command(
                 layer,
                 context.bounds,
                 context.persistence,
                 region.min,
                 region.max,
                 block,
-            )
+            )?;
+            for position in region_positions(region.min, region.max, block == BlockState::AIR) {
+                context
+                    .lifecycle
+                    .mark_dirty(ChunkColumn::from_block_pos(position));
+            }
+            Ok(result)
         }
         _ => Err(format!("unknown MCP tool `{}`", request.name)),
     }
@@ -738,17 +986,32 @@ fn network_json(
     })
 }
 
-fn storage_json(stats: &PersistenceStatsSnapshot, db_path: &std::path::Path) -> serde_json::Value {
+fn storage_json(
+    stats: &PersistenceStatsSnapshot,
+    persistence: &PersistenceRuntime,
+) -> serde_json::Value {
     serde_json::json!({
         "backend": stats.storage_backend,
         "schema_version": stats.schema_version,
         "save_format_version": stats.save_format_version,
-        "database_path": db_path.display().to_string(),
-        "loaded_overrides": stats.loaded_overrides,
+        "database_path": persistence.db_path().display().to_string(),
+        "region_dir": persistence.region_dir().display().to_string(),
+        "loaded_legacy_overrides": stats.loaded_legacy_overrides,
         "pending_edits": stats.pending_edits,
         "flushed_edits": stats.flushed_edits,
         "flush_batches": stats.flush_batches,
         "failed_flushes": stats.failed_flushes,
+        "dirty_chunks": stats.dirty_chunks,
+    })
+}
+
+fn chunk_lifecycle_json(lifecycle: &ChunkLifecycle) -> serde_json::Value {
+    serde_json::json!({
+        "loaded_chunks": lifecycle.loaded.len(),
+        "generated_chunks": lifecycle.generated_chunks,
+        "storage_loaded_chunks": lifecycle.storage_loaded_chunks,
+        "unloaded_chunks": lifecycle.unloaded_chunks,
+        "dirty_chunks_marked": lifecycle.dirty_chunks_marked,
     })
 }
 
@@ -835,7 +1098,7 @@ fn update_debug_telemetry(
 
 fn telemetry_header(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "World Loom V2 | tick {} | players {} | view {} chunks",
+        "World Loom V3 | tick {} | players {} | view {} chunks",
         snapshot.tick,
         snapshot.players.len(),
         snapshot.view_distance_chunks
@@ -856,7 +1119,7 @@ fn telemetry_footer(snapshot: &TelemetrySnapshot) -> String {
 
 fn telemetry_action_bar(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "V2 tick {} | MSPT {:.2}/{:.2} avg | {} players | {} chunks",
+        "V3 tick {} | MSPT {:.2}/{:.2} avg | {} players | {} chunks",
         snapshot.tick,
         snapshot.last_mspt,
         snapshot.avg_mspt,
@@ -938,7 +1201,7 @@ mod tests {
 
         assert_eq!(
             telemetry_header(&snapshot),
-            "World Loom V2 | tick 80 | players 2 | view 6 chunks"
+            "World Loom V3 | tick 80 | players 2 | view 6 chunks"
         );
         assert_eq!(
             telemetry_footer(&snapshot),
@@ -946,7 +1209,7 @@ mod tests {
         );
         assert_eq!(
             telemetry_action_bar(&snapshot),
-            "V2 tick 80 | MSPT 3.25/3.00 avg | 2 players | 64 chunks"
+            "V3 tick 80 | MSPT 3.25/3.00 avg | 2 players | 64 chunks"
         );
     }
 

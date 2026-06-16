@@ -1,19 +1,20 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use valence::prelude::{BlockPos, BlockState, ItemKind};
-use valence::ChunkLayer;
+use valence::{ChunkLayer, ChunkPos};
 
 pub const GROUND_Y: i32 = 64;
 pub const SPAWN_FEET_Y: i32 = GROUND_Y + 1;
 pub const SPAWN_HEAD_Y: i32 = GROUND_Y + 2;
 
 pub const WORLD_BOUNDS: WorldBounds = WorldBounds {
-    min_x: -64,
-    max_x: 63,
+    min_x: -256,
+    max_x: 255,
     min_y: GROUND_Y - 4,
     max_y: GROUND_Y + 31,
-    min_z: -64,
-    max_z: 63,
+    min_z: -256,
+    max_z: 255,
 };
 
 pub const HOTBAR_BLOCKS: [ItemKind; 6] = [
@@ -44,6 +45,52 @@ pub struct WorldBounds {
     pub max_z: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChunkColumn {
+    pub x: i32,
+    pub z: i32,
+}
+
+impl ChunkColumn {
+    pub const fn new(x: i32, z: i32) -> Self {
+        Self { x, z }
+    }
+
+    pub fn from_block_pos(position: BlockPos) -> Self {
+        Self::from_chunk_pos(ChunkPos::from_block_pos(position))
+    }
+
+    pub const fn from_chunk_pos(position: ChunkPos) -> Self {
+        Self {
+            x: position.x,
+            z: position.z,
+        }
+    }
+
+    pub const fn to_chunk_pos(self) -> ChunkPos {
+        ChunkPos::new(self.x, self.z)
+    }
+
+    pub fn region_coords(self, region_size_chunks: i32) -> (i32, i32) {
+        (
+            self.x.div_euclid(region_size_chunks),
+            self.z.div_euclid(region_size_chunks),
+        )
+    }
+}
+
+impl From<ChunkColumn> for ChunkPos {
+    fn from(column: ChunkColumn) -> Self {
+        column.to_chunk_pos()
+    }
+}
+
+impl From<ChunkPos> for ChunkColumn {
+    fn from(position: ChunkPos) -> Self {
+        Self::from_chunk_pos(position)
+    }
+}
+
 impl WorldBounds {
     pub fn contains(self, position: BlockPos) -> bool {
         (self.min_x..=self.max_x).contains(&position.x)
@@ -71,6 +118,11 @@ impl WorldBounds {
         let width = (self.max_chunk_x() - self.min_chunk_x() + 1).max(0) as usize;
         let depth = (self.max_chunk_z() - self.min_chunk_z() + 1).max(0) as usize;
         width * depth
+    }
+
+    pub fn contains_chunk(self, column: ChunkColumn) -> bool {
+        (self.min_chunk_x()..=self.max_chunk_x()).contains(&column.x)
+            && (self.min_chunk_z()..=self.max_chunk_z()).contains(&column.z)
     }
 }
 

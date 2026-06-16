@@ -3,6 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 DB_PATH=${WORLD_LOOM_DB_PATH:-"$ROOT/data/world-loom.sqlite3"}
+REGION_DIR=${WORLD_LOOM_REGION_DIR:-"$ROOT/data/regions"}
 BACKUP_DIR=${WORLD_LOOM_BACKUP_DIR:-"$ROOT/backups"}
 
 if [ ! -f "$DB_PATH" ]; then
@@ -14,6 +15,7 @@ mkdir -p "$BACKUP_DIR"
 
 STAMP=$(date -u +"%Y%m%dT%H%M%SZ")
 BACKUP_PATH="$BACKUP_DIR/world-loom-$STAMP.sqlite3"
+REGION_BACKUP_PATH="$BACKUP_DIR/world-loom-$STAMP-regions"
 MANIFEST_PATH="$BACKUP_DIR/world-loom-$STAMP.manifest.json"
 
 if command -v sqlite3 >/dev/null 2>&1; then
@@ -34,11 +36,21 @@ else
   STORAGE_BACKEND="unknown"
 fi
 
+rm -rf "$REGION_BACKUP_PATH"
+if [ -d "$REGION_DIR" ]; then
+  mkdir -p "$REGION_BACKUP_PATH"
+  cp -R "$REGION_DIR"/. "$REGION_BACKUP_PATH"/
+else
+  mkdir -p "$REGION_BACKUP_PATH"
+fi
+
 cat >"$MANIFEST_PATH" <<EOF
 {
   "created_at_utc": "$STAMP",
   "source_path": "$DB_PATH",
   "backup_path": "$BACKUP_PATH",
+  "region_source_path": "$REGION_DIR",
+  "region_backup_path": "$REGION_BACKUP_PATH",
   "storage_backend": "$STORAGE_BACKEND",
   "schema_version": "$SCHEMA_VERSION",
   "save_format_version": "$SAVE_FORMAT_VERSION",
@@ -48,4 +60,5 @@ EOF
 
 echo "World Loom backup written:"
 echo "  database: $BACKUP_PATH"
+echo "  regions: $REGION_BACKUP_PATH"
 echo "  manifest: $MANIFEST_PATH"
