@@ -2,7 +2,7 @@
 
 This repository owns the future Rust authoritative server for World Loom Online.
 
-M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. V3 adds chunk lifecycle and region-file chunk storage foundations. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
+M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. V3 adds chunk lifecycle and region-file chunk storage foundations. V3.1 replaces the temporary JSON region backend with Anvil `.mca` region files. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
 
 ## What M2 Provides
 
@@ -74,10 +74,18 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 - Chunks load/generate around player interest and unload when no longer needed.
 - MCP reads/edits load required chunks before accessing live world state.
 - `WorldStorage` now exposes chunk-oriented operations.
-- `RegionChunkStorage` stores edited chunk bulk data under `data/regions` by default.
-- `HybridRegionStorage` keeps SQLite for metadata, command log, dirty chunk index, backup manifest, and legacy SQLite delta fallback.
 - Successful edits still route through `WorldCommand`, then enqueue persistence work.
-- Backup and clear-save scripts cover both SQLite metadata and region chunk files.
+- Backup and clear-save scripts cover both SQLite metadata and chunk bulk files.
+
+## What V3.1 Corrects
+
+- Production chunk bulk storage is now Anvil `.mca` region files through `AnvilChunkStorage`.
+- `HybridAnvilStorage` keeps SQLite for metadata, schema/save format version, command log, dirty chunk index, backup manifest, and legacy SQLite delta fallback.
+- The old V3 JSON region backend is not the default production path.
+- Unedited chunks are still generated from the deterministic superflat generator and are not written to disk.
+- Dirty chunks are written as Anvil region chunks; reverting a dirty chunk to generated base removes the Anvil chunk.
+- SQLite `storage_backend` is `anvil_chunk_sqlite_metadata`.
+- SQLite schema version is `4`; save format version is `3`.
 
 ## Run
 
@@ -87,23 +95,23 @@ cargo run
 
 The server listens on Valence's default `0.0.0.0:25565`.
 
-By default, V3 stores SQLite metadata at:
+By default, V3.1 stores SQLite metadata at:
 
 ```text
 data/world-loom.sqlite3
 ```
 
-and region chunk files at:
+and Anvil region files at:
 
 ```text
-data/regions
+data/anvil/region
 ```
 
 Use `WORLD_LOOM_DB_PATH` and `WORLD_LOOM_REGION_DIR` to override these paths for local tests:
 
 ```sh
 WORLD_LOOM_DB_PATH=/tmp/world-loom-test.sqlite3 \
-WORLD_LOOM_REGION_DIR=/tmp/world-loom-test-regions \
+WORLD_LOOM_REGION_DIR=/tmp/world-loom-test-anvil-region \
   cargo run
 ```
 
@@ -210,7 +218,7 @@ The stack-level smoke tests start the local repos and run browser verification:
 
 Read-only:
 
-- `server_status`: tick, player count, bounds, database path, region path, MCP endpoint, MSPT telemetry, chunk interest/lifecycle stats, bridge backpressure config, SQLite schema/save format versions, dirty chunk count, and writer queue stats.
+- `server_status`: tick, player count, bounds, database path, Anvil region path, MCP endpoint, MSPT telemetry, chunk interest/lifecycle stats, bridge backpressure config, SQLite schema/save format versions, dirty chunk count, and writer queue stats.
 - `list_players`: connected player names, positions, and ping.
 - `get_world_bounds`: bounded world coordinates.
 - `get_block`: one live block.
@@ -270,17 +278,17 @@ All edit tools use `WorldCommand`, so bounds, spawn protection, foundation prote
 
 `block_state_raw` is Valence `BlockState::to_raw()` for the current Minecraft protocol version.
 
-`block_overrides` remains in the schema for legacy V1/V2 SQLite delta fallback. V3 chunk bulk writes go to region files instead of adding new `block_overrides` rows.
+`block_overrides` remains in the schema for legacy V1/V2 SQLite delta fallback. V3.1 chunk bulk writes go to Anvil `.mca` region files instead of adding new `block_overrides` rows.
 
 ## Reset / Backup
 
-Back up the local save with the V3 backup script:
+Back up the local save with the V3.1 backup script:
 
 ```sh
 ./scripts/backup-save.sh
 ```
 
-By default this writes an ignored `backups/world-loom-*.sqlite3` file, a copied `backups/world-loom-*-regions` directory, and a JSON manifest. Set `WORLD_LOOM_DB_PATH`, `WORLD_LOOM_REGION_DIR`, and `WORLD_LOOM_BACKUP_DIR` to override the source and destination.
+By default this writes an ignored `backups/world-loom-*.sqlite3` file, a copied `backups/world-loom-*-anvil-region` directory, and a JSON manifest. Set `WORLD_LOOM_DB_PATH`, `WORLD_LOOM_REGION_DIR`, and `WORLD_LOOM_BACKUP_DIR` to override the source and destination.
 
 Clear the default local save:
 
@@ -288,9 +296,9 @@ Clear the default local save:
 ./scripts/clear-save.sh
 ```
 
-The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and region directory. It refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
+The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and Anvil region directory. It refuses paths outside this repo's `data/` directory or `/tmp/world-loom-*`.
 
-## Not In V3
+## Not In V3.1
 
 - No complex MCP permission system.
 - No public Cloudflare Worker proxy.
@@ -298,8 +306,8 @@ The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and region direc
 - No new gameplay systems.
 - No true infinite world yet.
 - No Valence core changes.
-- No direct Minecraft Anvil import/export yet.
+- No broad Minecraft world import/export UX yet.
 
 ## Next Direction
 
-After V3, the next practical work is V4 family-play hardening: production process management, MCP authorization/audit UX, simple admin backup/restore operations, and the first World Loom-specific visible behavior.
+After V3.1, the next practical work is V4 family-play hardening: production process management, MCP authorization/audit UX, simple admin backup/restore operations, and the first World Loom-specific visible behavior.

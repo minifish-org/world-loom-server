@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -10,27 +11,32 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use fastanvil::Region as AnvilRegion;
+use fastnbt::LongArray;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use valence::prelude::{BlockPos, BlockState, Resource};
+use valence::block::{PropName, PropValue};
+use valence::prelude::{BlockKind, BlockPos, BlockState, Resource};
 
 use crate::world_command::{base_block_state_at, ChunkColumn, WorldCommand, WORLD_BOUNDS};
 
 pub const DATABASE_PATH_ENV: &str = "WORLD_LOOM_DB_PATH";
 pub const REGION_DIR_ENV: &str = "WORLD_LOOM_REGION_DIR";
 pub const DEFAULT_DATABASE_PATH: &str = "data/world-loom.sqlite3";
-pub const DEFAULT_REGION_DIR: &str = "data/regions";
+pub const DEFAULT_REGION_DIR: &str = "data/anvil/region";
 pub const WORLD_ID: &str = "default";
-pub const STORAGE_BACKEND: &str = "region_chunk_sqlite_metadata";
+pub const STORAGE_BACKEND: &str = "anvil_chunk_sqlite_metadata";
 pub const SQLITE_DELTA_BACKEND: &str = "sqlite_delta";
-pub const REGION_STORAGE_BACKEND: &str = "region_chunk";
-pub const SCHEMA_VERSION: i64 = 3;
-pub const SAVE_FORMAT_VERSION: i64 = 2;
+pub const ANVIL_STORAGE_BACKEND: &str = "anvil_chunk";
+pub const SCHEMA_VERSION: i64 = 4;
+pub const SAVE_FORMAT_VERSION: i64 = 3;
 
 const WRITE_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const WRITE_BATCH_LIMIT: usize = 256;
 const REGION_SIZE_CHUNKS: i32 = 32;
-const REGION_FILE_FORMAT_VERSION: i64 = 1;
+const ANVIL_DATA_VERSION_1_20_1: i32 = 3465;
+const ANVIL_CHUNK_STATUS: &str = "minecraft:full";
+const ANVIL_DEFAULT_BIOME: &str = "minecraft:plains";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
@@ -38,7 +44,9 @@ pub type PersistenceResult<T> = Result<T, PersistenceError>;
 pub enum PersistenceError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
-    Json(serde_json::Error),
+    Anvil(fastanvil::Error),
+    Nbt(fastnbt::error::Error),
+    InvalidAnvilChunk(String),
     InvalidBlockState { position: BlockPos, raw: i64 },
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     UnsupportedSaveFormatVersion { found: i64, supported: i64 },
@@ -50,7 +58,9 @@ impl fmt::Display for PersistenceError {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::Sqlite(err) => write!(f, "SQLite error: {err}"),
-            Self::Json(err) => write!(f, "JSON storage error: {err}"),
+            Self::Anvil(err) => write!(f, "Anvil region error: {err}"),
+            Self::Nbt(err) => write!(f, "Anvil NBT error: {err}"),
+            Self::InvalidAnvilChunk(reason) => write!(f, "invalid Anvil chunk: {reason}"),
             Self::InvalidBlockState { position, raw } => {
                 write!(f, "invalid block state raw id {raw} at {position:?}")
             }
@@ -81,9 +91,15 @@ impl From<rusqlite::Error> for PersistenceError {
     }
 }
 
-impl From<serde_json::Error> for PersistenceError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
+impl From<fastanvil::Error> for PersistenceError {
+    fn from(err: fastanvil::Error) -> Self {
+        Self::Anvil(err)
+    }
+}
+
+impl From<fastnbt::error::Error> for PersistenceError {
+    fn from(err: fastnbt::error::Error) -> Self {
+        Self::Nbt(err)
     }
 }
 
@@ -249,11 +265,11 @@ impl WorldStorage for SqliteDeltaStorage {
 }
 
 #[derive(Debug, Clone)]
-pub struct RegionChunkStorage {
+pub struct AnvilChunkStorage {
     region_dir: PathBuf,
 }
 
-impl RegionChunkStorage {
+impl AnvilChunkStorage {
     pub fn open(path: impl Into<PathBuf>) -> PersistenceResult<Self> {
         let region_dir = path.into();
         fs::create_dir_all(&region_dir)?;
@@ -265,35 +281,15 @@ impl RegionChunkStorage {
     }
 
     pub fn load_chunk(&self, column: ChunkColumn) -> PersistenceResult<Option<StoredChunk>> {
-        let region = self.load_region_file(column)?;
-        let Some(record) = region
-            .chunks
-            .iter()
-            .find(|chunk| chunk.chunk_x == column.x && chunk.chunk_z == column.z)
-        else {
+        let (region_x, region_z) = column.region_coords(REGION_SIZE_CHUNKS);
+        let path = self.region_file_path(region_x, region_z);
+        if !path.exists() {
             return Ok(None);
-        };
-
-        let mut blocks = Vec::with_capacity(record.blocks.len());
-        for block in &record.blocks {
-            let position = BlockPos::new(
-                column.x * 16 + i32::from(block.x),
-                block.y,
-                column.z * 16 + i32::from(block.z),
-            );
-            let Some(state) = BlockState::from_raw(block.block_state_raw) else {
-                return Err(PersistenceError::InvalidBlockState {
-                    position,
-                    raw: i64::from(block.block_state_raw),
-                });
-            };
-            blocks.push(SavedBlockOverride {
-                position,
-                block: state,
-            });
         }
 
-        Ok(Some(StoredChunk { column, blocks }))
+        let file = File::open(path)?;
+        let mut region = AnvilRegion::from_stream(file)?;
+        read_chunk_from_anvil_region(&mut region, column)
     }
 
     pub fn persist_block_edits(&self, edits: &[BlockEdit]) -> PersistenceResult<usize> {
@@ -301,27 +297,46 @@ impl RegionChunkStorage {
             return Ok(0);
         }
 
-        let mut by_region: BTreeMap<(i32, i32), Vec<&BlockEdit>> = BTreeMap::new();
+        let mut by_region: BTreeMap<(i32, i32), BTreeMap<ChunkColumn, Vec<&BlockEdit>>> =
+            BTreeMap::new();
         for edit in edits {
+            let column = ChunkColumn::from_block_pos(edit.position);
             by_region
-                .entry(ChunkColumn::from_block_pos(edit.position).region_coords(REGION_SIZE_CHUNKS))
+                .entry(column.region_coords(REGION_SIZE_CHUNKS))
+                .or_default()
+                .entry(column)
                 .or_default()
                 .push(edit);
         }
 
         let mut dirty_chunks = 0;
         for ((region_x, region_z), region_edits) in by_region {
-            let mut region = self.load_region_file_by_coords(region_x, region_z)?;
-            let before = region.chunks.len();
-            apply_region_edits(&mut region, &region_edits);
-            dirty_chunks += count_distinct_chunks(&region_edits);
-            self.write_region_file(region_x, region_z, &region)?;
+            let path = self.region_file_path(region_x, region_z);
+            let mut region = self.open_region_for_write(region_x, region_z)?;
 
-            if before > 0 && region.chunks.is_empty() {
-                let path = self.region_file_path(region_x, region_z);
-                if path.exists() {
-                    fs::remove_file(path)?;
+            for (column, chunk_edits) in region_edits {
+                let mut blocks = read_chunk_from_anvil_region(&mut region, column)?
+                    .map(|chunk| chunk.blocks)
+                    .unwrap_or_default();
+                apply_block_edits_to_overrides(&mut blocks, &chunk_edits);
+
+                let (local_x, local_z) = local_chunk_coords(column);
+                if blocks.is_empty() {
+                    region.remove_chunk(local_x, local_z)?;
+                } else {
+                    let bytes = encode_anvil_chunk(column, &blocks)?;
+                    region.write_chunk(local_x, local_z, &bytes)?;
                 }
+
+                dirty_chunks += 1;
+            }
+
+            let mut file = region.into_inner()?;
+            let len = file.stream_position()?;
+            file.set_len(len)?;
+
+            if !anvil_region_has_chunks(&path)? {
+                fs::remove_file(path)?;
             }
         }
 
@@ -335,73 +350,55 @@ impl RegionChunkStorage {
         copy_dir_recursive(&self.region_dir, target_dir)
     }
 
-    fn load_region_file(&self, column: ChunkColumn) -> PersistenceResult<RegionFile> {
-        let (region_x, region_z) = column.region_coords(REGION_SIZE_CHUNKS);
-        self.load_region_file_by_coords(region_x, region_z)
-    }
-
-    fn load_region_file_by_coords(
+    fn open_region_for_write(
         &self,
         region_x: i32,
         region_z: i32,
-    ) -> PersistenceResult<RegionFile> {
-        let path = self.region_file_path(region_x, region_z);
-        if !path.exists() {
-            return Ok(RegionFile::default());
-        }
-
-        let bytes = fs::read(path)?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    fn write_region_file(
-        &self,
-        region_x: i32,
-        region_z: i32,
-        region: &RegionFile,
-    ) -> PersistenceResult<()> {
+    ) -> PersistenceResult<AnvilRegion<File>> {
         fs::create_dir_all(&self.region_dir)?;
-        if region.chunks.is_empty() {
-            return Ok(());
-        }
-
         let path = self.region_file_path(region_x, region_z);
-        let temp_path = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(region)?;
-        fs::write(&temp_path, bytes)?;
-        fs::rename(temp_path, path)?;
-        Ok(())
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+
+        if file.metadata()?.len() == 0 {
+            Ok(AnvilRegion::create(file)?)
+        } else {
+            Ok(AnvilRegion::from_stream(file)?)
+        }
     }
 
     fn region_file_path(&self, region_x: i32, region_z: i32) -> PathBuf {
-        self.region_dir
-            .join(format!("r.{region_x}.{region_z}.json"))
+        self.region_dir.join(format!("r.{region_x}.{region_z}.mca"))
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct HybridRegionStorage {
+pub struct HybridAnvilStorage {
     sqlite: SqliteDeltaStorage,
-    regions: RegionChunkStorage,
+    anvil: AnvilChunkStorage,
 }
 
-impl HybridRegionStorage {
+impl HybridAnvilStorage {
     pub fn open(
         db_path: impl Into<PathBuf>,
         region_dir: impl Into<PathBuf>,
     ) -> PersistenceResult<Self> {
         Ok(Self {
             sqlite: SqliteDeltaStorage::open(db_path)?,
-            regions: RegionChunkStorage::open(region_dir)?,
+            anvil: AnvilChunkStorage::open(region_dir)?,
         })
     }
 
-    pub fn region_storage(&self) -> &RegionChunkStorage {
-        &self.regions
+    pub fn anvil_storage(&self) -> &AnvilChunkStorage {
+        &self.anvil
     }
 }
 
-impl WorldStorage for HybridRegionStorage {
+impl WorldStorage for HybridAnvilStorage {
     fn backend_name(&self) -> &'static str {
         STORAGE_BACKEND
     }
@@ -411,7 +408,7 @@ impl WorldStorage for HybridRegionStorage {
     }
 
     fn region_dir(&self) -> Option<&Path> {
-        Some(self.regions.region_dir())
+        Some(self.anvil.region_dir())
     }
 
     fn schema_version(&self) -> i64 {
@@ -423,7 +420,7 @@ impl WorldStorage for HybridRegionStorage {
     }
 
     fn load_chunk(&self, column: ChunkColumn) -> PersistenceResult<Option<StoredChunk>> {
-        if let Some(chunk) = self.regions.load_chunk(column)? {
+        if let Some(chunk) = self.anvil.load_chunk(column)? {
             return Ok(Some(chunk));
         }
 
@@ -431,7 +428,7 @@ impl WorldStorage for HybridRegionStorage {
     }
 
     fn persist_block_edits(&self, edits: &[BlockEdit]) -> PersistenceResult<()> {
-        self.regions.persist_block_edits(edits)?;
+        self.anvil.persist_block_edits(edits)?;
         let mut conn = Connection::open(self.sqlite.db_path())?;
         initialize_schema(&mut conn)?;
         flush_command_log_and_dirty_index(&mut conn, edits)?;
@@ -451,12 +448,12 @@ impl WorldStorage for HybridRegionStorage {
         let mut conn = Connection::open(self.sqlite.db_path())?;
         initialize_schema(&mut conn)?;
         conn.backup(DatabaseName::Main, backup_path, None)?;
-        self.regions.backup_to(region_backup_path)?;
+        self.anvil.backup_to(region_backup_path)?;
 
         let manifest = BackupManifest {
             source_path: self.sqlite.db_path().to_path_buf(),
             backup_path: backup_path.to_path_buf(),
-            region_source_path: self.regions.region_dir().to_path_buf(),
+            region_source_path: self.anvil.region_dir().to_path_buf(),
             region_backup_path: region_backup_path.to_path_buf(),
             storage_backend: self.backend_name(),
             schema_version: self.schema_version(),
@@ -468,92 +465,368 @@ impl WorldStorage for HybridRegionStorage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegionFile {
-    format_version: i64,
-    chunks: Vec<StoredChunkRecord>,
+struct AnvilChunkNbt {
+    #[serde(rename = "DataVersion")]
+    data_version: i32,
+    #[serde(rename = "xPos")]
+    x_pos: i32,
+    #[serde(rename = "yPos")]
+    y_pos: i32,
+    #[serde(rename = "zPos")]
+    z_pos: i32,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "LastUpdate")]
+    last_update: i64,
+    #[serde(rename = "InhabitedTime")]
+    inhabited_time: i64,
+    #[serde(default)]
+    sections: Vec<AnvilSection>,
+    #[serde(default)]
+    block_entities: Vec<BTreeMap<String, fastnbt::Value>>,
 }
 
-impl Default for RegionFile {
-    fn default() -> Self {
-        Self {
-            format_version: REGION_FILE_FORMAT_VERSION,
-            chunks: Vec::new(),
-        }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilSection {
+    #[serde(rename = "Y")]
+    y: i8,
+    block_states: AnvilBlockStates,
+    biomes: AnvilBiomes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilBlockStates {
+    palette: Vec<AnvilPaletteEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<LongArray>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilBiomes {
+    palette: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<LongArray>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilPaletteEntry {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Properties", skip_serializing_if = "Option::is_none")]
+    properties: Option<BTreeMap<String, String>>,
+}
+
+fn read_chunk_from_anvil_region(
+    region: &mut AnvilRegion<File>,
+    column: ChunkColumn,
+) -> PersistenceResult<Option<StoredChunk>> {
+    let (local_x, local_z) = local_chunk_coords(column);
+    let Some(bytes) = region.read_chunk(local_x, local_z)? else {
+        return Ok(None);
+    };
+
+    let chunk: AnvilChunkNbt = fastnbt::from_bytes(&bytes)?;
+    let blocks = decode_anvil_chunk_overrides(column, &chunk)?;
+    if blocks.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(StoredChunk { column, blocks }))
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredChunkRecord {
-    chunk_x: i32,
-    chunk_z: i32,
-    blocks: Vec<StoredBlockRecord>,
+fn encode_anvil_chunk(
+    column: ChunkColumn,
+    blocks: &[SavedBlockOverride],
+) -> PersistenceResult<Vec<u8>> {
+    let min_section = WORLD_BOUNDS.min_y.div_euclid(16);
+    let max_section = WORLD_BOUNDS.max_y.div_euclid(16);
+    let override_map = blocks
+        .iter()
+        .map(|saved| {
+            (
+                (saved.position.x, saved.position.y, saved.position.z),
+                saved.block,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let sections = (min_section..=max_section)
+        .map(|section_y| encode_anvil_section(column, section_y, &override_map))
+        .collect::<PersistenceResult<Vec<_>>>()?;
+
+    let chunk = AnvilChunkNbt {
+        data_version: ANVIL_DATA_VERSION_1_20_1,
+        x_pos: column.x,
+        y_pos: min_section,
+        z_pos: column.z,
+        status: ANVIL_CHUNK_STATUS.to_string(),
+        last_update: 0,
+        inhabited_time: 0,
+        sections,
+        block_entities: Vec::new(),
+    };
+
+    Ok(fastnbt::to_bytes(&chunk)?)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredBlockRecord {
-    x: u8,
-    y: i32,
-    z: u8,
-    block_state_raw: u16,
+fn encode_anvil_section(
+    column: ChunkColumn,
+    section_y: i32,
+    override_map: &BTreeMap<(i32, i32, i32), BlockState>,
+) -> PersistenceResult<AnvilSection> {
+    let mut palette = Vec::<BlockState>::new();
+    let mut indices = Vec::<usize>::with_capacity(4096);
+
+    for local_y in 0..16 {
+        let y = section_y * 16 + local_y;
+        for z in 0..16 {
+            let world_z = column.z * 16 + z;
+            for x in 0..16 {
+                let world_x = column.x * 16 + x;
+                let position = BlockPos::new(world_x, y, world_z);
+                let state = override_map
+                    .get(&(world_x, y, world_z))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        base_block_state_at(WORLD_BOUNDS, position).unwrap_or(BlockState::AIR)
+                    });
+
+                let index = palette
+                    .iter()
+                    .position(|existing| *existing == state)
+                    .unwrap_or_else(|| {
+                        palette.push(state);
+                        palette.len() - 1
+                    });
+                indices.push(index);
+            }
+        }
+    }
+
+    let data = (palette.len() > 1).then(|| pack_palette_indices(&indices, palette.len()));
+    let palette = palette
+        .into_iter()
+        .map(anvil_palette_entry_for_block)
+        .collect();
+
+    Ok(AnvilSection {
+        y: i8::try_from(section_y).map_err(|_| {
+            PersistenceError::InvalidAnvilChunk(format!(
+                "section y {section_y} cannot fit in Anvil byte"
+            ))
+        })?,
+        block_states: AnvilBlockStates { palette, data },
+        biomes: AnvilBiomes {
+            palette: vec![ANVIL_DEFAULT_BIOME.to_string()],
+            data: None,
+        },
+    })
 }
 
-fn apply_region_edits(region: &mut RegionFile, edits: &[&BlockEdit]) {
-    for edit in edits {
-        let column = ChunkColumn::from_block_pos(edit.position);
-        let local_x = edit.position.x.rem_euclid(16) as u8;
-        let local_z = edit.position.z.rem_euclid(16) as u8;
+fn decode_anvil_chunk_overrides(
+    column: ChunkColumn,
+    chunk: &AnvilChunkNbt,
+) -> PersistenceResult<Vec<SavedBlockOverride>> {
+    let mut blocks = Vec::new();
 
-        let Some(index) = region
-            .chunks
+    for section in &chunk.sections {
+        let palette = section
+            .block_states
+            .palette
             .iter()
-            .position(|chunk| chunk.chunk_x == column.x && chunk.chunk_z == column.z)
-        else {
-            if edit.needs_override() {
-                region.chunks.push(StoredChunkRecord {
-                    chunk_x: column.x,
-                    chunk_z: column.z,
-                    blocks: vec![StoredBlockRecord {
-                        x: local_x,
-                        y: edit.position.y,
-                        z: local_z,
-                        block_state_raw: edit.block.to_raw(),
-                    }],
-                });
-            }
-            continue;
-        };
+            .map(block_state_from_anvil_palette_entry)
+            .collect::<PersistenceResult<Vec<_>>>()?;
+        if palette.is_empty() {
+            return Err(PersistenceError::InvalidAnvilChunk(format!(
+                "chunk {},{} has a section with empty block palette",
+                column.x, column.z
+            )));
+        }
 
-        let chunk = &mut region.chunks[index];
-        let block_index = chunk.blocks.iter().position(|block| {
-            block.x == local_x && block.y == edit.position.y && block.z == local_z
-        });
-
-        if edit.needs_override() {
-            let record = StoredBlockRecord {
-                x: local_x,
-                y: edit.position.y,
-                z: local_z,
-                block_state_raw: edit.block.to_raw(),
+        for index in 0..4096 {
+            let palette_index =
+                unpack_palette_index(section.block_states.data.as_ref(), palette.len(), index)?;
+            let Some(block) = palette.get(palette_index).copied() else {
+                return Err(PersistenceError::InvalidAnvilChunk(format!(
+                    "chunk {},{} palette index {palette_index} is out of bounds",
+                    column.x, column.z
+                )));
             };
-            if let Some(block_index) = block_index {
-                chunk.blocks[block_index] = record;
-            } else {
-                chunk.blocks.push(record);
+
+            let local_x = (index % 16) as i32;
+            let local_z = ((index / 16) % 16) as i32;
+            let local_y = (index / (16 * 16)) as i32;
+            let position = BlockPos::new(
+                column.x * 16 + local_x,
+                i32::from(section.y) * 16 + local_y,
+                column.z * 16 + local_z,
+            );
+            if !WORLD_BOUNDS.contains(position) {
+                continue;
             }
-        } else if let Some(block_index) = block_index {
-            chunk.blocks.swap_remove(block_index);
+
+            let base = base_block_state_at(WORLD_BOUNDS, position).unwrap_or(BlockState::AIR);
+            if block != base {
+                blocks.push(SavedBlockOverride { position, block });
+            }
         }
     }
 
-    region.chunks.retain(|chunk| !chunk.blocks.is_empty());
+    blocks.sort_by_key(|block| (block.position.x, block.position.y, block.position.z));
+    Ok(blocks)
 }
 
-fn count_distinct_chunks(edits: &[&BlockEdit]) -> usize {
-    let mut chunks = std::collections::BTreeSet::new();
-    for edit in edits {
-        chunks.insert(ChunkColumn::from_block_pos(edit.position));
+fn anvil_palette_entry_for_block(block: BlockState) -> AnvilPaletteEntry {
+    let kind = block.to_kind();
+    let properties = kind
+        .props()
+        .iter()
+        .map(|prop| {
+            (
+                prop.to_str().to_string(),
+                block
+                    .get(*prop)
+                    .expect("block property should exist")
+                    .to_str()
+                    .to_string(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    AnvilPaletteEntry {
+        name: format!("minecraft:{}", kind.to_str()),
+        properties: (!properties.is_empty()).then_some(properties),
     }
-    chunks.len()
+}
+
+fn block_state_from_anvil_palette_entry(
+    entry: &AnvilPaletteEntry,
+) -> PersistenceResult<BlockState> {
+    let name = entry
+        .name
+        .strip_prefix("minecraft:")
+        .unwrap_or(entry.name.as_str());
+    let Some(kind) = BlockKind::from_str(name) else {
+        return Err(PersistenceError::InvalidAnvilChunk(format!(
+            "unknown block kind {}",
+            entry.name
+        )));
+    };
+
+    let mut state = kind.to_state();
+    if let Some(properties) = &entry.properties {
+        for (name, value) in properties {
+            let Some(prop_name) = PropName::from_str(name) else {
+                return Err(PersistenceError::InvalidAnvilChunk(format!(
+                    "unknown block property {name} on {}",
+                    entry.name
+                )));
+            };
+            let Some(prop_value) = PropValue::from_str(value) else {
+                return Err(PersistenceError::InvalidAnvilChunk(format!(
+                    "unknown block property value {value} on {}",
+                    entry.name
+                )));
+            };
+            state = state.set(prop_name, prop_value);
+        }
+    }
+
+    Ok(state)
+}
+
+fn apply_block_edits_to_overrides(blocks: &mut Vec<SavedBlockOverride>, edits: &[&BlockEdit]) {
+    let mut by_position = blocks
+        .iter()
+        .map(|block| {
+            (
+                (block.position.x, block.position.y, block.position.z),
+                block.block,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for edit in edits {
+        let key = (edit.position.x, edit.position.y, edit.position.z);
+        if edit.needs_override() {
+            by_position.insert(key, edit.block);
+        } else {
+            by_position.remove(&key);
+        }
+    }
+
+    *blocks = by_position
+        .into_iter()
+        .map(|((x, y, z), block)| SavedBlockOverride {
+            position: BlockPos::new(x, y, z),
+            block,
+        })
+        .collect();
+}
+
+fn pack_palette_indices(indices: &[usize], palette_len: usize) -> LongArray {
+    let bits = bits_per_palette_index(palette_len).max(4);
+    let values_per_long = 64 / bits;
+    let long_count = indices.len().div_ceil(values_per_long);
+    let mut longs = vec![0_i64; long_count];
+
+    for (index, palette_index) in indices.iter().copied().enumerate() {
+        let long_index = index / values_per_long;
+        let shift = (index % values_per_long) * bits;
+        longs[long_index] |= ((palette_index as u64) << shift) as i64;
+    }
+
+    LongArray::new(longs)
+}
+
+fn unpack_palette_index(
+    data: Option<&LongArray>,
+    palette_len: usize,
+    index: usize,
+) -> PersistenceResult<usize> {
+    if data.is_none() && palette_len == 1 {
+        return Ok(0);
+    }
+
+    let Some(data) = data else {
+        return Err(PersistenceError::InvalidAnvilChunk(
+            "multi-entry block palette is missing packed data".to_string(),
+        ));
+    };
+
+    let bits = bits_per_palette_index(palette_len).max(4);
+    let values_per_long = 64 / bits;
+    let long_index = index / values_per_long;
+    let Some(long) = data.get(long_index) else {
+        return Err(PersistenceError::InvalidAnvilChunk(format!(
+            "packed block data is too short for index {index}"
+        )));
+    };
+
+    let shift = (index % values_per_long) * bits;
+    let mask = (1_u64 << bits) - 1;
+    Ok(((*long as u64) >> shift & mask) as usize)
+}
+
+fn bits_per_palette_index(palette_len: usize) -> usize {
+    usize::BITS as usize - (palette_len.saturating_sub(1)).leading_zeros() as usize
+}
+
+fn local_chunk_coords(column: ChunkColumn) -> (usize, usize) {
+    (
+        column.x.rem_euclid(REGION_SIZE_CHUNKS) as usize,
+        column.z.rem_euclid(REGION_SIZE_CHUNKS) as usize,
+    )
+}
+
+fn anvil_region_has_chunks(path: &Path) -> PersistenceResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let file = File::open(path)?;
+    let mut region = AnvilRegion::from_stream(file)?;
+    Ok(region.iter().next().transpose()?.is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,7 +889,7 @@ impl PersistenceStats {
 }
 
 pub struct PersistenceRuntime {
-    storage: HybridRegionStorage,
+    storage: HybridAnvilStorage,
     db_path: PathBuf,
     region_dir: PathBuf,
     storage_backend: &'static str,
@@ -660,7 +933,7 @@ impl PersistenceRuntime {
     ) -> PersistenceResult<Self> {
         let db_path = db_path.into();
         let region_dir = region_dir.into();
-        let storage = HybridRegionStorage::open(&db_path, &region_dir)?;
+        let storage = HybridAnvilStorage::open(&db_path, &region_dir)?;
         let loaded_legacy_overrides = count_legacy_block_overrides(storage.db_path())?;
         let (sender, receiver) = mpsc::channel();
         let writer_storage = storage.clone();
@@ -759,16 +1032,16 @@ pub fn load_block_overrides(path: &Path) -> PersistenceResult<Vec<SavedBlockOver
 }
 
 pub fn persist_block_edits(path: &Path, edits: &[BlockEdit]) -> PersistenceResult<()> {
-    HybridRegionStorage::open(path, default_region_dir())?.persist_block_edits(edits)
+    HybridAnvilStorage::open(path, default_region_dir())?.persist_block_edits(edits)
 }
 
 pub fn backup_database(path: &Path, backup_path: &Path) -> PersistenceResult<BackupManifest> {
-    HybridRegionStorage::open(path, default_region_dir())?
+    HybridAnvilStorage::open(path, default_region_dir())?
         .create_backup(backup_path, &backup_path.with_extension("regions"))
 }
 
 fn writer_loop(
-    storage: HybridRegionStorage,
+    storage: HybridAnvilStorage,
     receiver: Receiver<PersistenceMessage>,
     stats: PersistenceStats,
 ) {
@@ -779,7 +1052,7 @@ fn writer_loop(
 }
 
 fn run_writer_loop(
-    storage: HybridRegionStorage,
+    storage: HybridAnvilStorage,
     receiver: Receiver<PersistenceMessage>,
     stats: &PersistenceStats,
 ) -> PersistenceResult<()> {
@@ -831,7 +1104,7 @@ fn drain_pending_messages(
 }
 
 fn flush_edits_and_record(
-    storage: &HybridRegionStorage,
+    storage: &HybridAnvilStorage,
     edits: &[BlockEdit],
     stats: &PersistenceStats,
 ) -> PersistenceResult<()> {
@@ -967,7 +1240,7 @@ fn initialize_schema(conn: &mut Connection) -> PersistenceResult<()> {
                 ",
                 params![
                     SCHEMA_VERSION,
-                    "add region chunk storage metadata and dirty chunk index"
+                    "switch chunk bulk storage to Anvil region files"
                 ],
             )?;
         }
@@ -1331,7 +1604,7 @@ mod tests {
     fn temp_region_dir(name: &str) -> PathBuf {
         let mut path = env::temp_dir();
         path.push(format!(
-            "world-loom-{name}-{}-{}.regions",
+            "world-loom-{name}-{}-{}.anvil-region",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1339,6 +1612,22 @@ mod tests {
                 .as_nanos()
         ));
         path
+    }
+
+    fn anvil_region_path(region_dir: &Path, column: ChunkColumn) -> PathBuf {
+        let (region_x, region_z) = column.region_coords(REGION_SIZE_CHUNKS);
+        region_dir.join(format!("r.{region_x}.{region_z}.mca"))
+    }
+
+    fn read_anvil_chunk_bytes(region_dir: &Path, column: ChunkColumn) -> Vec<u8> {
+        let path = anvil_region_path(region_dir, column);
+        let file = File::open(path).expect("open Anvil region test file");
+        let mut region = AnvilRegion::from_stream(file).expect("open Anvil region stream");
+        let (local_x, local_z) = local_chunk_coords(column);
+        region
+            .read_chunk(local_x, local_z)
+            .expect("read Anvil chunk")
+            .expect("Anvil chunk should exist")
     }
 
     fn pos(x: i32, y: i32, z: i32) -> BlockPos {
@@ -1384,8 +1673,10 @@ mod tests {
         let path = temp_db_path("round-trip");
         let region_dir = temp_region_dir("round-trip");
         let storage =
-            HybridRegionStorage::open(&path, &region_dir).expect("open hybrid region storage");
+            HybridAnvilStorage::open(&path, &region_dir).expect("open hybrid anvil storage");
         let position = pos(4, GROUND_Y + 1, 4);
+        let column = ChunkColumn::from_block_pos(position);
+        let region_path = anvil_region_path(&region_dir, column);
 
         storage
             .persist_block_edits(&[BlockEdit::from_world_command(
@@ -1399,7 +1690,7 @@ mod tests {
 
         assert_eq!(
             storage
-                .load_chunk(ChunkColumn::from_block_pos(position))
+                .load_chunk(column)
                 .expect("load stone chunk")
                 .expect("stored chunk")
                 .blocks,
@@ -1408,6 +1699,12 @@ mod tests {
                 block: BlockState::STONE
             }]
         );
+        assert!(
+            region_path.exists(),
+            "dirty chunk should be written to .mca"
+        );
+        fastanvil::JavaChunk::from_bytes(&read_anvil_chunk_bytes(&region_dir, column))
+            .expect("written chunk should parse as Java Anvil chunk");
 
         storage
             .persist_block_edits(&[BlockEdit::from_world_command(
@@ -1417,10 +1714,12 @@ mod tests {
             .expect("persist air revert");
 
         assert_eq!(
-            storage
-                .load_chunk(ChunkColumn::from_block_pos(position))
-                .expect("load reverted chunk"),
+            storage.load_chunk(column).expect("load reverted chunk"),
             None
+        );
+        assert!(
+            !region_path.exists(),
+            "fully reverted dirty chunk should remove empty .mca file"
         );
         assert_eq!(command_log_count(&path), 2);
 
@@ -1433,8 +1732,9 @@ mod tests {
         let path = temp_db_path("air-override");
         let region_dir = temp_region_dir("air-override");
         let storage =
-            HybridRegionStorage::open(&path, &region_dir).expect("open hybrid region storage");
+            HybridAnvilStorage::open(&path, &region_dir).expect("open hybrid anvil storage");
         let position = pos(4, GROUND_Y, 4);
+        let column = ChunkColumn::from_block_pos(position);
 
         storage
             .persist_block_edits(&[BlockEdit::from_world_command(
@@ -1445,7 +1745,7 @@ mod tests {
 
         assert_eq!(
             storage
-                .load_chunk(ChunkColumn::from_block_pos(position))
+                .load_chunk(column)
                 .expect("load air chunk")
                 .expect("stored chunk")
                 .blocks,
@@ -1453,6 +1753,10 @@ mod tests {
                 position,
                 block: BlockState::AIR
             }]
+        );
+        assert!(
+            anvil_region_path(&region_dir, column).exists(),
+            "base block removal should persist to an Anvil .mca file"
         );
         assert_eq!(command_log_count(&path), 1);
 
@@ -1479,7 +1783,7 @@ mod tests {
         }
 
         let storage =
-            HybridRegionStorage::open(&path, &region_dir).expect("open hybrid region storage");
+            HybridAnvilStorage::open(&path, &region_dir).expect("open hybrid anvil storage");
         assert_eq!(
             storage
                 .load_chunk(ChunkColumn::from_block_pos(position))
@@ -1544,7 +1848,7 @@ mod tests {
         }
 
         let region_dir = temp_region_dir("v1-migration");
-        let _storage = HybridRegionStorage::open(&path, &region_dir).expect("migrate v1 database");
+        let _storage = HybridAnvilStorage::open(&path, &region_dir).expect("migrate v1 database");
 
         assert_eq!(
             metadata_versions(&path),
@@ -1567,7 +1871,7 @@ mod tests {
         let region_dir = temp_region_dir("backup-source");
         let region_backup_path = temp_region_dir("backup-copy");
         let storage =
-            HybridRegionStorage::open(&path, &region_dir).expect("open hybrid region storage");
+            HybridAnvilStorage::open(&path, &region_dir).expect("open hybrid anvil storage");
         let position = pos(7, GROUND_Y + 1, 7);
 
         storage
@@ -1589,8 +1893,16 @@ mod tests {
         assert_eq!(manifest.region_source_path, region_dir);
         assert_eq!(manifest.region_backup_path, region_backup_path);
         assert_eq!(manifest.storage_backend, STORAGE_BACKEND);
+        assert!(
+            anvil_region_path(
+                &manifest.region_backup_path,
+                ChunkColumn::from_block_pos(position)
+            )
+            .exists(),
+            "backup should copy Anvil .mca files"
+        );
         let backup_storage =
-            HybridRegionStorage::open(&backup_path, &region_backup_path).expect("open backup");
+            HybridAnvilStorage::open(&backup_path, &region_backup_path).expect("open backup");
         assert_eq!(
             backup_storage
                 .load_chunk(ChunkColumn::from_block_pos(position))

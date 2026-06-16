@@ -6,6 +6,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws", "json"] }
+fastanvil = { version = "0.32", default-features = false }
+fastnbt = "2"
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }

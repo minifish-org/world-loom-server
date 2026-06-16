@@ -190,7 +190,7 @@ pub fn run() {
         persistence.loaded_legacy_overrides()
     );
     println!(
-        "[world-loom] region chunk path={}",
+        "[world-loom] Anvil region path={}",
         persistence.region_dir().display()
     );
     let mcp = McpRuntime::start_default()
@@ -300,7 +300,7 @@ fn init_clients(
         give_hotbar_blocks(&mut inventory);
 
         client.send_chat_message(format!(
-            "World Loom V3: chunk lifecycle and region storage enabled. Bounds are 512x512 blocks; view distance is {} chunks.",
+            "World Loom V3.1: chunk lifecycle and Anvil storage enabled. Bounds are 512x512 blocks; view distance is {} chunks.",
             interest.view_distance_chunks
         ));
     }
@@ -1098,7 +1098,7 @@ fn update_debug_telemetry(
 
 fn telemetry_header(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "World Loom V3 | tick {} | players {} | view {} chunks",
+        "World Loom V3.1 | tick {} | players {} | view {} chunks",
         snapshot.tick,
         snapshot.players.len(),
         snapshot.view_distance_chunks
@@ -1119,7 +1119,7 @@ fn telemetry_footer(snapshot: &TelemetrySnapshot) -> String {
 
 fn telemetry_action_bar(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "V3 tick {} | MSPT {:.2}/{:.2} avg | {} players | {} chunks",
+        "V3.1 tick {} | MSPT {:.2}/{:.2} avg | {} players | {} chunks",
         snapshot.tick,
         snapshot.last_mspt,
         snapshot.avg_mspt,
@@ -1201,7 +1201,7 @@ mod tests {
 
         assert_eq!(
             telemetry_header(&snapshot),
-            "World Loom V3 | tick 80 | players 2 | view 6 chunks"
+            "World Loom V3.1 | tick 80 | players 2 | view 6 chunks"
         );
         assert_eq!(
             telemetry_footer(&snapshot),
@@ -1209,7 +1209,7 @@ mod tests {
         );
         assert_eq!(
             telemetry_action_bar(&snapshot),
-            "V3 tick 80 | MSPT 3.25/3.00 avg | 2 players | 64 chunks"
+            "V3.1 tick 80 | MSPT 3.25/3.00 avg | 2 players | 64 chunks"
         );
     }
 
