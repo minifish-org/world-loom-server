@@ -34,7 +34,7 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 
 ## What M6 Adds
 
-- Local MCP endpoint at `http://127.0.0.1:8765/mcp`.
+- Local MCP endpoint at `http://127.0.0.1:18081/mcp`, served by the Rust bridge HTTP listener.
 - Streamable HTTP-style JSON-RPC support for `initialize`, `ping`, `tools/list`, and `tools/call`.
 - Read-only tools: `server_status`, `list_players`, `get_world_bounds`, `get_block`, `snapshot_region`.
 - Edit tools: `set_block`, `remove_block`, `fill_region`.
@@ -115,16 +115,10 @@ WORLD_LOOM_REGION_DIR=/tmp/world-loom-test-anvil-region \
   cargo run
 ```
 
-The MCP endpoint defaults to:
+The MCP endpoint shares the browser bridge listener and defaults to:
 
 ```text
-http://127.0.0.1:8765/mcp
-```
-
-Override it with:
-
-```sh
-WORLD_LOOM_MCP_ADDR=127.0.0.1:9876 cargo run
+http://127.0.0.1:18081/mcp
 ```
 
 The browser bridge endpoint defaults to:
@@ -195,7 +189,7 @@ Cloudflare Pages static client
   -> Valence TCP server on localhost:25565
 ```
 
-The deployment path keeps MCP on `127.0.0.1:8765` by default.
+The deployment path keeps MCP on the bridge listener at `127.0.0.1:18081/mcp` by default.
 
 ## Checks
 

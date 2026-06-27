@@ -2,12 +2,15 @@ use std::{
     collections::HashMap,
     env,
     net::{SocketAddr, ToSocketAddrs},
+    sync::mpsc::Sender as StdSender,
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
+use crate::mcp::{self, McpToolRequest, MCP_ENDPOINT_PATH, MCP_PROTOCOL_VERSION};
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
@@ -85,14 +88,14 @@ pub struct BridgeRuntime {
 impl Resource for BridgeRuntime {}
 
 impl BridgeRuntime {
-    pub fn start_default() -> Result<Self, BridgeError> {
+    pub fn start_default(mcp_sender: StdSender<McpToolRequest>) -> Result<Self, BridgeError> {
         let requested_addr =
             env::var(BRIDGE_ADDR_ENV).unwrap_or_else(|_| DEFAULT_BRIDGE_ADDR.into());
         let addr = resolve_addr(&requested_addr)
             .ok_or_else(|| BridgeError::InvalidAddress(requested_addr.clone()))?;
         let allowed_origins = AllowedOrigins::from_env();
         let config = BridgeConfig::from_env();
-        Self::start(addr, allowed_origins, config)
+        Self::start(addr, allowed_origins, config, mcp_sender)
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -107,6 +110,7 @@ impl BridgeRuntime {
         addr: SocketAddr,
         allowed_origins: AllowedOrigins,
         config: BridgeConfig,
+        mcp_sender: StdSender<McpToolRequest>,
     ) -> Result<Self, BridgeError> {
         let listener = std::net::TcpListener::bind(addr).map_err(BridgeError::Bind)?;
         listener.set_nonblocking(true).map_err(BridgeError::Bind)?;
@@ -138,7 +142,7 @@ impl BridgeRuntime {
                             return;
                         }
                     };
-                    let state = BridgeState::new(allowed_origins, config);
+                    let state = BridgeState::new(allowed_origins, config, mcp_sender);
                     let app = Router::new()
                         .route(
                             &format!("{API_ROOT}/connect"),
@@ -148,6 +152,10 @@ impl BridgeRuntime {
                         )
                         .route(&format!("{API_ROOT}/socket"), get(socket_ws))
                         .route(&format!("{API_ROOT}/ping"), get(ping_ws))
+                        .route(
+                            MCP_ENDPOINT_PATH,
+                            get(mcp_get).post(mcp_post).options(mcp_options),
+                        )
                         .with_state(state);
 
                     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -229,15 +237,21 @@ impl BridgeConfig {
 struct BridgeState {
     pending_connections: Arc<Mutex<HashMap<String, TcpStream>>>,
     allowed_origins: Arc<AllowedOrigins>,
+    mcp_sender: StdSender<McpToolRequest>,
     connect_timeout: Duration,
     config: BridgeConfig,
 }
 
 impl BridgeState {
-    fn new(allowed_origins: AllowedOrigins, config: BridgeConfig) -> Self {
+    fn new(
+        allowed_origins: AllowedOrigins,
+        config: BridgeConfig,
+        mcp_sender: StdSender<McpToolRequest>,
+    ) -> Self {
         Self {
             pending_connections: Arc::new(Mutex::new(HashMap::new())),
             allowed_origins: Arc::new(allowed_origins),
+            mcp_sender,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             config,
         }
@@ -528,6 +542,45 @@ async fn ping_ws(
     ws.on_upgrade(handle_ping_socket)
 }
 
+async fn mcp_options(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !state.is_origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    mcp_http_response(headers, &state, 204, None)
+}
+
+async fn mcp_get(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !state.is_origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    mcp_http_response(headers, &state, 405, None)
+}
+
+async fn mcp_post(State(state): State<BridgeState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !state.is_origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let mcp_sender = state.mcp_sender.clone();
+    let response = match tokio::task::spawn_blocking(move || {
+        mcp::handle_http_json_rpc_request(&body, mcp_sender)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("[world-loom] MCP HTTP task failed: {err}");
+            mcp::McpHttpResponse {
+                status: 500,
+                body: None,
+            }
+        }
+    };
+    mcp_http_response(headers, &state, response.status, response.body)
+}
+
 async fn handle_ping_socket(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
     while let Some(Ok(message)) = receiver.next().await {
@@ -537,6 +590,25 @@ async fn handle_ping_socket(socket: WebSocket) {
             }
         }
     }
+}
+
+fn mcp_http_response(
+    headers: HeaderMap,
+    state: &BridgeState,
+    status: u16,
+    body: Option<serde_json::Value>,
+) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let response = match body {
+        Some(body) => (status, body.to_string()).into_response(),
+        None => status.into_response(),
+    };
+    let mut response = with_cors(headers, state, response);
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("mcp-protocol-version"),
+        HeaderValue::from_static(MCP_PROTOCOL_VERSION),
+    );
+    response
 }
 
 async fn proxy_socket(socket: WebSocket, stream: TcpStream, config: BridgeConfig) {
@@ -654,7 +726,7 @@ fn with_cors(headers: HeaderMap, state: &BridgeState, mut response: Response) ->
     response_headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, cors_origin);
     response_headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Content-Type, Authorization"),
+        HeaderValue::from_static("Content-Type, Authorization, Accept, MCP-Protocol-Version"),
     );
     response_headers.insert(
         ACCESS_CONTROL_ALLOW_METHODS,
@@ -683,6 +755,8 @@ fn with_cors(headers: HeaderMap, state: &BridgeState, mut response: Response) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
 
     #[test]
     fn allowed_origins_can_allow_any_origin() {
@@ -731,6 +805,75 @@ mod tests {
             bounded_env_value(None, 100, 10, 200),
             100,
             "missing values fall back to default"
+        );
+    }
+
+    #[test]
+    fn bridge_serves_mcp_initialize_on_same_http_listener() {
+        let bridge = BridgeRuntime::start(
+            "127.0.0.1:0".parse().expect("socket addr"),
+            AllowedOrigins::Any,
+            BridgeConfig {
+                tcp_read_buffer_bytes: DEFAULT_TCP_READ_BUFFER_BYTES,
+                ws_queue_capacity: DEFAULT_WS_QUEUE_CAPACITY,
+                max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
+            },
+            std::sync::mpsc::channel().0,
+        )
+        .expect("bridge should start");
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize"
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Origin: http://localhost:3000\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {}",
+            bridge.addr(),
+            body.len(),
+            body
+        );
+
+        let mut stream = std::net::TcpStream::connect(bridge.addr()).expect("connect to bridge");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response_bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => response_bytes.extend_from_slice(&buffer[..read]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if response_bytes.is_empty() {
+                        panic!("read response: {err}");
+                    }
+                    break;
+                }
+                Err(err) => panic!("read response: {err}"),
+            }
+        }
+        let response = String::from_utf8(response_bytes).expect("response should be utf8");
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("\"name\":\"world-loom-server\""),
+            "unexpected response: {response}"
         );
     }
 }

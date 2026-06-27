@@ -16,17 +16,15 @@ Cloudflare Pages serves static files only. Do not add a Cloudflare Worker proxy 
 
 ```text
 25565  Valence Minecraft TCP server
-18081  Rust browser bridge HTTP/WebSocket endpoint
-8765   local MCP HTTP endpoint
+18081  Rust browser bridge HTTP/WebSocket endpoint and local MCP /mcp endpoint
 443    Caddy HTTPS/WSS reverse proxy on the Tailscale host
 ```
 
 Recommended binding:
 
 - `WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18081`
-- `WORLD_LOOM_MCP_ADDR=127.0.0.1:8765`
-- Caddy exposes only the browser bridge over HTTPS to tailnet users.
-- Keep MCP local unless a later milestone adds auth/permissions.
+- Caddy exposes the browser bridge over HTTPS to tailnet users.
+- MCP is served at `http://127.0.0.1:18081/mcp`; keep it local or route-protected unless a later milestone adds auth/permissions.
 
 ## Tailscale Prerequisites
 
@@ -54,7 +52,6 @@ Run the server:
 WORLD_LOOM_DB_PATH=/var/lib/world-loom/world-loom.sqlite3 \
 WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18081 \
 WORLD_LOOM_ALLOWED_ORIGINS=https://<project>.pages.dev,https://<custom-domain> \
-WORLD_LOOM_MCP_ADDR=127.0.0.1:8765 \
 cargo run --release
 ```
 
@@ -92,6 +89,7 @@ Caddy supports WebSocket upgrade traffic through `reverse_proxy`, so the same si
 ```text
 https://<machine>.<tailnet>.ts.net/api/vm/net/connect
 wss://<machine>.<tailnet>.ts.net/api/vm/net/socket
+https://<machine>.<tailnet>.ts.net/mcp
 ```
 
 If the host has public network interfaces, bind Caddy to the Tailscale IP rather than all interfaces. The Rust bridge should stay on `127.0.0.1:18081` behind Caddy.

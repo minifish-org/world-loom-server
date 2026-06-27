@@ -11,7 +11,7 @@ use valence::spawn::IsFlat;
 use crate::bridge::BridgeRuntime;
 use crate::mcp::{
     block_json, block_state_name, required_block_pos, required_block_state, required_region,
-    McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS,
+    McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS, MCP_ENDPOINT_PATH,
 };
 use crate::persistence::{PersistenceRuntime, PersistenceStatsSnapshot, StoredChunk};
 use crate::world_command::{
@@ -193,14 +193,17 @@ pub fn run() {
         "[world-loom] Anvil region path={}",
         persistence.region_dir().display()
     );
-    let mcp = McpRuntime::start_default()
-        .unwrap_or_else(|err| panic!("failed to start local MCP server: {err}"));
-    println!("[world-loom] MCP endpoint=http://{}/mcp", mcp.addr());
-    let bridge = BridgeRuntime::start_default()
+    let mcp = McpRuntime::new();
+    let bridge = BridgeRuntime::start_default(mcp.sender())
         .unwrap_or_else(|err| panic!("failed to start browser bridge: {err}"));
     println!(
         "[world-loom] browser bridge endpoint=http://{}",
         bridge.addr()
+    );
+    println!(
+        "[world-loom] MCP endpoint=http://{}{}",
+        bridge.addr(),
+        MCP_ENDPOINT_PATH
     );
     let bridge_config = bridge.config();
     println!(
@@ -637,7 +640,7 @@ fn handle_mcp_requests(
                 interest: &interest,
                 bridge: &bridge,
                 lifecycle: &mut lifecycle,
-                mcp_addr: mcp.addr().to_string(),
+                mcp_endpoint: format!("http://{}{}", bridge.addr(), MCP_ENDPOINT_PATH),
                 players: player_list_json(&clients),
             };
             handle_mcp_tool(&request, &mut layer, context)
@@ -654,7 +657,7 @@ struct McpToolContext<'a> {
     interest: &'a InterestConfig,
     bridge: &'a BridgeRuntime,
     lifecycle: &'a mut ChunkLifecycle,
-    mcp_addr: String,
+    mcp_endpoint: String,
     players: Vec<serde_json::Value>,
 }
 
@@ -672,7 +675,7 @@ fn handle_mcp_tool(
                 "connected_players": context.players.len(),
                 "world_bounds": world_bounds_json(context.bounds),
                 "database_path": context.persistence.db_path().display().to_string(),
-                "mcp_endpoint": format!("http://{}/mcp", context.mcp_addr),
+                "mcp_endpoint": context.mcp_endpoint,
                 "performance": performance_json(context.telemetry),
                 "network": network_json(
                     context.telemetry,
