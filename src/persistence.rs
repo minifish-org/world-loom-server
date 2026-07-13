@@ -28,7 +28,7 @@ pub const WORLD_ID: &str = "default";
 pub const STORAGE_BACKEND: &str = "anvil_chunk_sqlite_metadata";
 pub const SQLITE_DELTA_BACKEND: &str = "sqlite_delta";
 pub const ANVIL_STORAGE_BACKEND: &str = "anvil_chunk";
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 pub const SAVE_FORMAT_VERSION: i64 = 3;
 
 const WRITE_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
@@ -156,6 +156,67 @@ pub struct SavedBlockOverride {
 pub struct StoredChunk {
     pub column: ChunkColumn,
     pub blocks: Vec<SavedBlockOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildBlockRecord {
+    pub position: BlockPos,
+    pub original_block: BlockState,
+    pub applied_block: BlockState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBuildRecord {
+    pub build_id: String,
+    pub idempotency_key: String,
+    pub plan_hash: String,
+    pub canonical_plan_json: String,
+    pub actor: String,
+    pub blocks: Vec<BuildBlockRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBuild {
+    pub build_id: String,
+    pub idempotency_key: String,
+    pub plan_hash: String,
+    pub canonical_plan_json: String,
+    pub actor: String,
+    pub state: String,
+    pub changed: usize,
+    pub skipped: usize,
+    pub created_at: String,
+    pub applied_at: String,
+    pub undone_at: Option<String>,
+    pub blocks: Vec<BuildBlockRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredAssetDefinition {
+    pub asset_id: String,
+    pub version: u32,
+    pub spec_hash: String,
+    pub canonical_spec_json: String,
+    pub budget_json: String,
+    pub actor: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredAssetInstance {
+    pub instance_id: String,
+    pub idempotency_key: String,
+    pub asset_id: String,
+    pub version: u32,
+    pub position: [f64; 3],
+    pub rotation_degrees: [f64; 3],
+    pub scale: [f64; 3],
+    pub collision_json: String,
+    pub interaction_state_json: String,
+    pub owner: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub removed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,11 +481,27 @@ impl WorldStorage for HybridAnvilStorage {
     }
 
     fn load_chunk(&self, column: ChunkColumn) -> PersistenceResult<Option<StoredChunk>> {
-        if let Some(chunk) = self.anvil.load_chunk(column)? {
-            return Ok(Some(chunk));
+        let anvil = self.anvil.load_chunk(column)?;
+        let sqlite = self.sqlite.load_chunk(column)?;
+        if anvil.is_none() && sqlite.is_none() {
+            return Ok(None);
         }
 
-        self.sqlite.load_chunk(column)
+        let mut merged = BTreeMap::new();
+        for saved in anvil
+            .into_iter()
+            .flat_map(|chunk| chunk.blocks)
+            .chain(sqlite.into_iter().flat_map(|chunk| chunk.blocks))
+        {
+            merged.insert(
+                (saved.position.x, saved.position.y, saved.position.z),
+                saved,
+            );
+        }
+        Ok(Some(StoredChunk {
+            column,
+            blocks: merged.into_values().collect(),
+        }))
     }
 
     fn persist_block_edits(&self, edits: &[BlockEdit]) -> PersistenceResult<()> {
@@ -990,6 +1067,353 @@ impl PersistenceRuntime {
             eprintln!("[world-loom] failed to queue SQLite block edit: {err}");
         }
     }
+
+    pub fn load_build_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> PersistenceResult<Option<StoredBuild>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        load_build_by_column(&conn, "idempotency_key", idempotency_key)
+    }
+
+    pub fn load_build(&self, build_id: &str) -> PersistenceResult<Option<StoredBuild>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        load_build_by_column(&conn, "build_id", build_id)
+    }
+
+    pub fn persist_build(&self, record: &NewBuildRecord) -> PersistenceResult<StoredBuild> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "
+            INSERT INTO builds (
+                build_id, world_id, idempotency_key, plan_hash,
+                canonical_plan_json, actor, state, changed, skipped,
+                applied_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'applied', ?7, 0, CURRENT_TIMESTAMP)
+            ",
+            params![
+                record.build_id,
+                WORLD_ID,
+                record.idempotency_key,
+                record.plan_hash,
+                record.canonical_plan_json,
+                record.actor,
+                i64::try_from(record.blocks.len()).unwrap_or(i64::MAX),
+            ],
+        )?;
+
+        for (ordinal, block) in record.blocks.iter().enumerate() {
+            tx.execute(
+                "
+                INSERT INTO build_blocks (
+                    build_id, ordinal, x, y, z,
+                    original_block_state_raw, applied_block_state_raw
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    record.build_id,
+                    i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    block.position.x,
+                    block.position.y,
+                    block.position.z,
+                    i64::from(block.original_block.to_raw()),
+                    i64::from(block.applied_block.to_raw()),
+                ],
+            )?;
+            set_transactional_override(&tx, block.position, block.applied_block)?;
+            mark_transactional_chunk_dirty(&tx, block.position)?;
+        }
+
+        tx.commit()?;
+        load_build_by_column(&conn, "build_id", &record.build_id)?.ok_or_else(|| {
+            PersistenceError::InvalidAnvilChunk(
+                "committed build could not be loaded from metadata".to_string(),
+            )
+        })
+    }
+
+    pub fn mark_build_undone(&self, build: &StoredBuild) -> PersistenceResult<StoredBuild> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "
+            UPDATE builds
+            SET state = 'undone', undone_at = CURRENT_TIMESTAMP
+            WHERE world_id = ?1 AND build_id = ?2 AND state = 'applied'
+            ",
+            params![WORLD_ID, build.build_id],
+        )?;
+        if updated == 0 {
+            tx.rollback()?;
+            return self.load_build(&build.build_id)?.ok_or_else(|| {
+                PersistenceError::InvalidAnvilChunk(
+                    "build disappeared while marking undo".to_string(),
+                )
+            });
+        }
+
+        for block in &build.blocks {
+            set_transactional_override(&tx, block.position, block.original_block)?;
+            mark_transactional_chunk_dirty(&tx, block.position)?;
+        }
+        tx.commit()?;
+        load_build_by_column(&conn, "build_id", &build.build_id)?.ok_or_else(|| {
+            PersistenceError::InvalidAnvilChunk(
+                "undone build could not be loaded from metadata".to_string(),
+            )
+        })
+    }
+
+    pub fn list_asset_definitions(&self) -> PersistenceResult<Vec<StoredAssetDefinition>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        let mut statement = conn.prepare(
+            "
+            SELECT asset_id, version, spec_hash, canonical_spec_json,
+                   budget_json, actor, created_at
+            FROM asset_definitions
+            WHERE world_id = ?1
+            ORDER BY asset_id, version
+            ",
+        )?;
+        let rows = statement.query_map(params![WORLD_ID], asset_definition_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn load_asset_definition(
+        &self,
+        asset_id: &str,
+        version: u32,
+    ) -> PersistenceResult<Option<StoredAssetDefinition>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        conn.query_row(
+            "
+            SELECT asset_id, version, spec_hash, canonical_spec_json,
+                   budget_json, actor, created_at
+            FROM asset_definitions
+            WHERE world_id = ?1 AND asset_id = ?2 AND version = ?3
+            ",
+            params![WORLD_ID, asset_id, i64::from(version)],
+            asset_definition_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn persist_asset_definition(
+        &self,
+        asset_id: &str,
+        version: u32,
+        spec_hash: &str,
+        canonical_spec_json: &str,
+        budget_json: &str,
+        actor: &str,
+    ) -> PersistenceResult<StoredAssetDefinition> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        conn.execute(
+            "
+            INSERT INTO asset_definitions (
+                world_id, asset_id, version, spec_hash,
+                canonical_spec_json, budget_json, actor
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                WORLD_ID,
+                asset_id,
+                i64::from(version),
+                spec_hash,
+                canonical_spec_json,
+                budget_json,
+                actor,
+            ],
+        )?;
+        conn.query_row(
+            "
+            SELECT asset_id, version, spec_hash, canonical_spec_json,
+                   budget_json, actor, created_at
+            FROM asset_definitions
+            WHERE world_id = ?1 AND asset_id = ?2 AND version = ?3
+            ",
+            params![WORLD_ID, asset_id, i64::from(version)],
+            asset_definition_from_row,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn list_asset_instances(&self) -> PersistenceResult<Vec<StoredAssetInstance>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        let mut statement = conn.prepare(&format!(
+            "{} WHERE world_id = ?1 AND removed_at IS NULL ORDER BY created_at, instance_id",
+            ASSET_INSTANCE_SELECT
+        ))?;
+        let rows = statement.query_map(params![WORLD_ID], asset_instance_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn load_asset_instance(
+        &self,
+        instance_id: &str,
+    ) -> PersistenceResult<Option<StoredAssetInstance>> {
+        self.load_asset_instance_by("instance_id", instance_id)
+    }
+
+    pub fn load_asset_instance_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> PersistenceResult<Option<StoredAssetInstance>> {
+        self.load_asset_instance_by("idempotency_key", idempotency_key)
+    }
+
+    fn load_asset_instance_by(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> PersistenceResult<Option<StoredAssetInstance>> {
+        debug_assert!(matches!(column, "instance_id" | "idempotency_key"));
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        conn.query_row(
+            &format!(
+                "{} WHERE world_id = ?1 AND {column} = ?2",
+                ASSET_INSTANCE_SELECT
+            ),
+            params![WORLD_ID, value],
+            asset_instance_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn persist_asset_instance(
+        &self,
+        instance: &StoredAssetInstance,
+    ) -> PersistenceResult<StoredAssetInstance> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        conn.execute(
+            "
+            INSERT INTO asset_instances (
+                instance_id, world_id, idempotency_key, asset_id, asset_version,
+                position_x, position_y, position_z,
+                rotation_x, rotation_y, rotation_z,
+                scale_x, scale_y, scale_z,
+                collision_json, interaction_state_json, owner
+            )
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+            )
+            ",
+            params![
+                instance.instance_id,
+                WORLD_ID,
+                instance.idempotency_key,
+                instance.asset_id,
+                i64::from(instance.version),
+                instance.position[0],
+                instance.position[1],
+                instance.position[2],
+                instance.rotation_degrees[0],
+                instance.rotation_degrees[1],
+                instance.rotation_degrees[2],
+                instance.scale[0],
+                instance.scale[1],
+                instance.scale[2],
+                instance.collision_json,
+                instance.interaction_state_json,
+                instance.owner,
+            ],
+        )?;
+        self.load_asset_instance(&instance.instance_id)?
+            .ok_or_else(|| {
+                PersistenceError::InvalidAnvilChunk(
+                    "persisted asset instance could not be loaded".to_string(),
+                )
+            })
+    }
+
+    pub fn update_asset_instance(
+        &self,
+        instance: &StoredAssetInstance,
+    ) -> PersistenceResult<StoredAssetInstance> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        let updated = conn.execute(
+            "
+            UPDATE asset_instances
+            SET position_x = ?3, position_y = ?4, position_z = ?5,
+                rotation_x = ?6, rotation_y = ?7, rotation_z = ?8,
+                scale_x = ?9, scale_y = ?10, scale_z = ?11,
+                collision_json = ?12, interaction_state_json = ?13,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE world_id = ?1 AND instance_id = ?2 AND removed_at IS NULL
+            ",
+            params![
+                WORLD_ID,
+                instance.instance_id,
+                instance.position[0],
+                instance.position[1],
+                instance.position[2],
+                instance.rotation_degrees[0],
+                instance.rotation_degrees[1],
+                instance.rotation_degrees[2],
+                instance.scale[0],
+                instance.scale[1],
+                instance.scale[2],
+                instance.collision_json,
+                instance.interaction_state_json,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(PersistenceError::InvalidAnvilChunk(
+                "asset instance is missing or removed".to_string(),
+            ));
+        }
+        self.load_asset_instance(&instance.instance_id)?
+            .ok_or_else(|| {
+                PersistenceError::InvalidAnvilChunk(
+                    "updated asset instance could not be loaded".to_string(),
+                )
+            })
+    }
+
+    pub fn remove_asset_instance(
+        &self,
+        instance_id: &str,
+    ) -> PersistenceResult<Option<StoredAssetInstance>> {
+        let mut conn = Connection::open(&self.db_path)?;
+        initialize_schema(&mut conn)?;
+        conn.execute(
+            "
+            UPDATE asset_instances
+            SET removed_at = COALESCE(removed_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE world_id = ?1 AND instance_id = ?2
+            ",
+            params![WORLD_ID, instance_id],
+        )?;
+        conn.query_row(
+            &format!(
+                "{} WHERE world_id = ?1 AND instance_id = ?2",
+                ASSET_INSTANCE_SELECT
+            ),
+            params![WORLD_ID, instance_id],
+            asset_instance_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
 }
 
 impl Drop for PersistenceRuntime {
@@ -1186,6 +1610,81 @@ fn initialize_schema(conn: &mut Connection) -> PersistenceResult<()> {
             FOREIGN KEY (world_id) REFERENCES world_metadata(world_id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS builds (
+            build_id TEXT PRIMARY KEY,
+            world_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            canonical_plan_json TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('applied', 'undone')),
+            changed INTEGER NOT NULL,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            undone_at TEXT,
+            UNIQUE (world_id, idempotency_key),
+            FOREIGN KEY (world_id) REFERENCES world_metadata(world_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_builds_world_state
+            ON builds (world_id, state, created_at);
+
+        CREATE TABLE IF NOT EXISTS build_blocks (
+            build_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            x INTEGER NOT NULL,
+            y INTEGER NOT NULL,
+            z INTEGER NOT NULL,
+            original_block_state_raw INTEGER NOT NULL,
+            applied_block_state_raw INTEGER NOT NULL,
+            PRIMARY KEY (build_id, ordinal),
+            UNIQUE (build_id, x, y, z),
+            FOREIGN KEY (build_id) REFERENCES builds(build_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_definitions (
+            world_id TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            spec_hash TEXT NOT NULL,
+            canonical_spec_json TEXT NOT NULL,
+            budget_json TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (world_id, asset_id, version),
+            FOREIGN KEY (world_id) REFERENCES world_metadata(world_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_instances (
+            instance_id TEXT PRIMARY KEY,
+            world_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            asset_version INTEGER NOT NULL,
+            position_x REAL NOT NULL,
+            position_y REAL NOT NULL,
+            position_z REAL NOT NULL,
+            rotation_x REAL NOT NULL,
+            rotation_y REAL NOT NULL,
+            rotation_z REAL NOT NULL,
+            scale_x REAL NOT NULL,
+            scale_y REAL NOT NULL,
+            scale_z REAL NOT NULL,
+            collision_json TEXT NOT NULL,
+            interaction_state_json TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            removed_at TEXT,
+            UNIQUE (world_id, idempotency_key),
+            FOREIGN KEY (world_id, asset_id, asset_version)
+                REFERENCES asset_definitions(world_id, asset_id, version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_asset_instances_world_active
+            ON asset_instances (world_id, removed_at, created_at);
+
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             description TEXT NOT NULL,
@@ -1240,7 +1739,7 @@ fn initialize_schema(conn: &mut Connection) -> PersistenceResult<()> {
                 ",
                 params![
                     SCHEMA_VERSION,
-                    "switch chunk bulk storage to Anvil region files"
+                    "add declarative asset catalog and persistent instances"
                 ],
             )?;
         }
@@ -1310,6 +1809,195 @@ fn ensure_column(
         "ALTER TABLE {table} ADD COLUMN {column} {definition};"
     ))?;
     Ok(())
+}
+
+fn set_transactional_override(
+    tx: &rusqlite::Transaction<'_>,
+    position: BlockPos,
+    block: BlockState,
+) -> PersistenceResult<()> {
+    let base = base_block_state_at(WORLD_BOUNDS, position).unwrap_or(BlockState::AIR);
+    if block == base {
+        tx.execute(
+            "DELETE FROM block_overrides WHERE world_id = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            params![WORLD_ID, position.x, position.y, position.z],
+        )?;
+    } else {
+        tx.execute(
+            "
+            INSERT INTO block_overrides (
+                world_id, x, y, z, block_state_raw, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+            ON CONFLICT(world_id, x, y, z) DO UPDATE SET
+                block_state_raw = excluded.block_state_raw,
+                updated_at = CURRENT_TIMESTAMP
+            ",
+            params![
+                WORLD_ID,
+                position.x,
+                position.y,
+                position.z,
+                i64::from(block.to_raw()),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_transactional_chunk_dirty(
+    tx: &rusqlite::Transaction<'_>,
+    position: BlockPos,
+) -> PersistenceResult<()> {
+    let chunk = ChunkColumn::from_block_pos(position);
+    tx.execute(
+        "
+        INSERT INTO dirty_chunks (
+            world_id, chunk_x, chunk_z, dirty_count, last_dirty_at, last_flushed_at
+        )
+        VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(world_id, chunk_x, chunk_z) DO UPDATE SET
+            dirty_count = dirty_count + 1,
+            last_dirty_at = CURRENT_TIMESTAMP,
+            last_flushed_at = CURRENT_TIMESTAMP
+        ",
+        params![WORLD_ID, chunk.x, chunk.z],
+    )?;
+    Ok(())
+}
+
+fn load_build_by_column(
+    conn: &Connection,
+    column: &str,
+    value: &str,
+) -> PersistenceResult<Option<StoredBuild>> {
+    debug_assert!(matches!(column, "build_id" | "idempotency_key"));
+    let sql = format!(
+        "
+        SELECT build_id, idempotency_key, plan_hash, canonical_plan_json,
+               actor, state, changed, skipped, created_at, applied_at, undone_at
+        FROM builds
+        WHERE world_id = ?1 AND {column} = ?2
+        "
+    );
+    let row = conn
+        .query_row(&sql, params![WORLD_ID, value], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .optional()?;
+    let Some((
+        build_id,
+        idempotency_key,
+        plan_hash,
+        canonical_plan_json,
+        actor,
+        state,
+        changed,
+        skipped,
+        created_at,
+        applied_at,
+        undone_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let mut statement = conn.prepare(
+        "
+        SELECT x, y, z, original_block_state_raw, applied_block_state_raw
+        FROM build_blocks
+        WHERE build_id = ?1
+        ORDER BY ordinal
+        ",
+    )?;
+    let mut rows = statement.query(params![build_id])?;
+    let mut blocks = Vec::new();
+    while let Some(row) = rows.next()? {
+        let position = BlockPos::new(row.get(0)?, row.get(1)?, row.get(2)?);
+        let original_raw = row.get::<_, i64>(3)?;
+        let applied_raw = row.get::<_, i64>(4)?;
+        let original_block = decode_block_state(position, original_raw)?;
+        let applied_block = decode_block_state(position, applied_raw)?;
+        blocks.push(BuildBlockRecord {
+            position,
+            original_block,
+            applied_block,
+        });
+    }
+
+    Ok(Some(StoredBuild {
+        build_id,
+        idempotency_key,
+        plan_hash,
+        canonical_plan_json,
+        actor,
+        state,
+        changed: usize::try_from(changed).unwrap_or(usize::MAX),
+        skipped: usize::try_from(skipped).unwrap_or(usize::MAX),
+        created_at,
+        applied_at,
+        undone_at,
+        blocks,
+    }))
+}
+
+fn decode_block_state(position: BlockPos, raw: i64) -> PersistenceResult<BlockState> {
+    u16::try_from(raw)
+        .ok()
+        .and_then(BlockState::from_raw)
+        .ok_or(PersistenceError::InvalidBlockState { position, raw })
+}
+
+const ASSET_INSTANCE_SELECT: &str = "
+    SELECT instance_id, idempotency_key, asset_id, asset_version,
+           position_x, position_y, position_z,
+           rotation_x, rotation_y, rotation_z,
+           scale_x, scale_y, scale_z,
+           collision_json, interaction_state_json, owner,
+           created_at, updated_at, removed_at
+    FROM asset_instances
+";
+
+fn asset_definition_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAssetDefinition> {
+    Ok(StoredAssetDefinition {
+        asset_id: row.get(0)?,
+        version: row.get::<_, i64>(1)?.max(0) as u32,
+        spec_hash: row.get(2)?,
+        canonical_spec_json: row.get(3)?,
+        budget_json: row.get(4)?,
+        actor: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn asset_instance_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAssetInstance> {
+    Ok(StoredAssetInstance {
+        instance_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        asset_id: row.get(2)?,
+        version: row.get::<_, i64>(3)?.max(0) as u32,
+        position: [row.get(4)?, row.get(5)?, row.get(6)?],
+        rotation_degrees: [row.get(7)?, row.get(8)?, row.get(9)?],
+        scale: [row.get(10)?, row.get(11)?, row.get(12)?],
+        collision_json: row.get(13)?,
+        interaction_state_json: row.get(14)?,
+        owner: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        removed_at: row.get(18)?,
+    })
 }
 
 fn load_legacy_block_overrides(path: &Path) -> PersistenceResult<Vec<SavedBlockOverride>> {
@@ -1489,6 +2177,13 @@ fn flush_command_log_and_dirty_index(
     let tx = conn.transaction()?;
 
     for edit in edits {
+        // Anvil is authoritative for ordinary edits. Clear any transactional
+        // SQLite overlay at the same coordinate after the Anvil write succeeds
+        // so a later restart cannot resurrect a superseded build block.
+        tx.execute(
+            "DELETE FROM block_overrides WHERE world_id = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            params![WORLD_ID, edit.position.x, edit.position.y, edit.position.z],
+        )?;
         tx.execute(
             "
             INSERT INTO command_log (
@@ -1919,5 +2614,81 @@ mod tests {
         let _ = fs::remove_file(backup_path);
         let _ = fs::remove_dir_all(region_dir);
         let _ = fs::remove_dir_all(region_backup_path);
+    }
+
+    #[test]
+    fn build_and_exact_undo_survive_runtime_restart() {
+        let path = temp_db_path("build-restart");
+        let region_dir = temp_region_dir("build-restart");
+        let position = pos(18, GROUND_Y + 1, 18);
+        let column = ChunkColumn::from_block_pos(position);
+        let record = NewBuildRecord {
+            build_id: "build-test-id".to_string(),
+            idempotency_key: "build-test-key".to_string(),
+            plan_hash: "abc123".to_string(),
+            canonical_plan_json: "{\"schema_version\":1}".to_string(),
+            actor: "mcp".to_string(),
+            blocks: vec![BuildBlockRecord {
+                position,
+                original_block: BlockState::AIR,
+                applied_block: BlockState::GLASS,
+            }],
+        };
+
+        {
+            let runtime = PersistenceRuntime::open_with_region_dir(&path, &region_dir)
+                .expect("open build persistence runtime");
+            let stored = runtime.persist_build(&record).expect("persist build");
+            assert_eq!(stored.state, "applied");
+            assert_eq!(
+                runtime
+                    .load_build_by_idempotency_key("build-test-key")
+                    .expect("load idempotency record")
+                    .expect("build should exist")
+                    .build_id,
+                "build-test-id"
+            );
+        }
+
+        {
+            let runtime = PersistenceRuntime::open_with_region_dir(&path, &region_dir)
+                .expect("reopen after build");
+            let chunk = runtime
+                .load_chunk(column)
+                .expect("load persisted build chunk")
+                .expect("build overlay should create stored chunk");
+            assert_eq!(
+                chunk.blocks,
+                vec![SavedBlockOverride {
+                    position,
+                    block: BlockState::GLASS,
+                }]
+            );
+            let build = runtime
+                .load_build("build-test-id")
+                .expect("load build")
+                .expect("build should exist");
+            let undone = runtime.mark_build_undone(&build).expect("persist undo");
+            assert_eq!(undone.state, "undone");
+        }
+
+        {
+            let runtime = PersistenceRuntime::open_with_region_dir(&path, &region_dir)
+                .expect("reopen after undo");
+            assert_eq!(
+                runtime.load_chunk(column).expect("load undone chunk"),
+                None,
+                "undo should remove an air-equivalent transactional override"
+            );
+            let build = runtime
+                .load_build("build-test-id")
+                .expect("load undone build")
+                .expect("undone audit record should remain");
+            assert_eq!(build.state, "undone");
+            assert!(build.undone_at.is_some());
+        }
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(region_dir);
     }
 }

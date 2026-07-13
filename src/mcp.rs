@@ -6,6 +6,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use valence::prelude::{BlockPos, BlockState, Resource};
 
+use crate::build_plan::{parse_build_plan, BuildPlan, MAX_BUILD_OPERATIONS, MAX_BUILD_TARGETS};
+
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 pub const MAX_SNAPSHOT_BLOCKS: i64 = 512;
@@ -177,6 +179,49 @@ pub fn required_region(arguments: &Value, limit: i64) -> Result<Region, String> 
     Ok(region)
 }
 
+pub fn required_build_plan(arguments: &Value) -> Result<BuildPlan, String> {
+    parse_build_plan(arguments.get("plan").unwrap_or(arguments))
+}
+
+pub fn required_build_id(arguments: &Value) -> Result<&str, String> {
+    arguments
+        .get("build_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| "build_id must be a non-empty string of at most 128 bytes".to_string())
+}
+
+pub fn required_sculpt_spec(arguments: &Value) -> Result<&Value, String> {
+    arguments
+        .get("spec")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "missing object argument `spec`".to_string())
+}
+
+pub fn required_string<'a>(
+    arguments: &'a Value,
+    name: &str,
+    max_bytes: usize,
+) -> Result<&'a str, String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
+        .ok_or_else(|| format!("`{name}` must be a non-empty string of at most {max_bytes} bytes"))
+}
+
+pub fn optional_u32(arguments: &Value, name: &str) -> Result<Option<u32>, String> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("`{name}` must be an unsigned integer"))?;
+    u32::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("`{name}` is outside u32 range"))
+}
+
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -235,6 +280,97 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": fill_region_schema(),
             "annotations": { "destructiveHint": true }
         }),
+        json!({
+            "name": "validate_build_plan",
+            "title": "Validate Build Plan",
+            "description": format!("Validate BuildPlan v1 without mutation. Maximum {MAX_BUILD_OPERATIONS} operations and {MAX_BUILD_TARGETS} expanded targets."),
+            "inputSchema": build_plan_tool_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "apply_build_plan",
+            "title": "Apply Build Plan",
+            "description": "Atomically validate, apply, persist, and record an undoable BuildPlan v1.",
+            "inputSchema": build_plan_tool_schema(),
+            "annotations": { "destructiveHint": true, "idempotentHint": true }
+        }),
+        json!({
+            "name": "get_build",
+            "title": "Get Build",
+            "description": "Return the persisted summary and state for a build_id.",
+            "inputSchema": build_id_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "undo_build",
+            "title": "Undo Build",
+            "description": "Atomically restore the exact captured state for a build. Repeated undo is safe.",
+            "inputSchema": build_id_schema(),
+            "annotations": { "destructiveHint": true, "idempotentHint": true }
+        }),
+        json!({
+            "name": "validate_sculpt_spec",
+            "title": "Validate Sculpt Spec",
+            "description": "Validate a bounded declarative SculptSpec v1 without publishing it.",
+            "inputSchema": sculpt_spec_tool_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "inspect_asset_budget",
+            "title": "Inspect Asset Budget",
+            "description": "Return deterministic SculptSpec validation and geometry budgets without mutation.",
+            "inputSchema": sculpt_spec_tool_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "publish_asset",
+            "title": "Publish Asset",
+            "description": "Validate and persist one immutable SculptSpec asset version.",
+            "inputSchema": sculpt_spec_tool_schema(),
+            "annotations": { "destructiveHint": false, "idempotentHint": true }
+        }),
+        json!({
+            "name": "list_assets",
+            "title": "List Assets",
+            "description": "List the authoritative declarative asset catalog.",
+            "inputSchema": object_schema(json!({}), vec![]),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "get_asset",
+            "title": "Get Asset",
+            "description": "Get one asset version, or the latest version when version is omitted.",
+            "inputSchema": get_asset_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "spawn_asset",
+            "title": "Spawn Asset",
+            "description": "Persist and synchronize one bounded asset instance.",
+            "inputSchema": spawn_asset_schema(),
+            "annotations": { "destructiveHint": false, "idempotentHint": true }
+        }),
+        json!({
+            "name": "update_asset",
+            "title": "Update Asset Instance",
+            "description": "Persist and synchronize a complete transform/state replacement for an active instance.",
+            "inputSchema": update_asset_schema(),
+            "annotations": { "destructiveHint": false }
+        }),
+        json!({
+            "name": "remove_asset",
+            "title": "Remove Asset Instance",
+            "description": "Persist and synchronize removal of an asset instance. Repeated removal is safe.",
+            "inputSchema": instance_id_schema(),
+            "annotations": { "destructiveHint": true, "idempotentHint": true }
+        }),
+        json!({
+            "name": "list_asset_instances",
+            "title": "List Asset Instances",
+            "description": "List active authoritative asset instances.",
+            "inputSchema": object_schema(json!({}), vec![]),
+            "annotations": { "readOnlyHint": true }
+        }),
     ]
 }
 
@@ -249,6 +385,19 @@ pub fn is_known_tool(name: &str) -> bool {
             | "set_block"
             | "remove_block"
             | "fill_region"
+            | "validate_build_plan"
+            | "apply_build_plan"
+            | "get_build"
+            | "undo_build"
+            | "validate_sculpt_spec"
+            | "inspect_asset_budget"
+            | "publish_asset"
+            | "list_assets"
+            | "get_asset"
+            | "spawn_asset"
+            | "update_asset"
+            | "remove_asset"
+            | "list_asset_instances"
     )
 }
 
@@ -480,12 +629,164 @@ fn fill_region_schema() -> Value {
     )
 }
 
+fn build_plan_tool_schema() -> Value {
+    object_schema(
+        json!({
+            "plan": {
+                "type": "object",
+                "description": "BuildPlan v1 document",
+                "properties": {
+                    "schema_version": { "type": "integer" },
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "anchor": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" },
+                            "z": { "type": "integer" }
+                        },
+                        "required": ["x", "y", "z"],
+                        "additionalProperties": false
+                    },
+                    "replace_mode": { "type": "string" },
+                    "operations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_BUILD_OPERATIONS,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "const": "set" },
+                                        "at": coordinate_array_schema(),
+                                        "block": { "type": "string" }
+                                    },
+                                    "required": ["op", "at", "block"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "const": "fill_box" },
+                                        "from": coordinate_array_schema(),
+                                        "to": coordinate_array_schema(),
+                                        "block": { "type": "string" }
+                                    },
+                                    "required": ["op", "from", "to", "block"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["schema_version", "idempotency_key", "anchor", "replace_mode", "operations"],
+                "additionalProperties": false
+            }
+        }),
+        vec!["plan"],
+    )
+}
+
+fn coordinate_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "integer" },
+        "minItems": 3,
+        "maxItems": 3
+    })
+}
+
+fn build_id_schema() -> Value {
+    object_schema(
+        json!({
+            "build_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }),
+        vec!["build_id"],
+    )
+}
+
+fn sculpt_spec_tool_schema() -> Value {
+    object_schema(
+        json!({
+            "spec": {
+                "type": "object",
+                "description": "SculptSpec v1 document from world-loom-online/specs/sculpt-spec-v1.md"
+            }
+        }),
+        vec!["spec"],
+    )
+}
+
+fn get_asset_schema() -> Value {
+    object_schema(
+        json!({
+            "asset_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "version": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        }),
+        vec!["asset_id"],
+    )
+}
+
+fn vector3_number_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "number" },
+        "minItems": 3,
+        "maxItems": 3
+    })
+}
+
+fn spawn_asset_schema() -> Value {
+    object_schema(
+        json!({
+            "asset_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "position": vector3_number_schema(),
+            "rotation_degrees": vector3_number_schema(),
+            "scale": vector3_number_schema(),
+            "interaction_state": { "type": "object", "maxProperties": 32 }
+        }),
+        vec![
+            "asset_id",
+            "version",
+            "idempotency_key",
+            "position",
+            "rotation_degrees",
+            "scale",
+        ],
+    )
+}
+
+fn update_asset_schema() -> Value {
+    object_schema(
+        json!({
+            "instance_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "position": vector3_number_schema(),
+            "rotation_degrees": vector3_number_schema(),
+            "scale": vector3_number_schema(),
+            "interaction_state": { "type": "object", "maxProperties": 32 }
+        }),
+        vec!["instance_id", "position", "rotation_degrees", "scale"],
+    )
+}
+
+fn instance_id_schema() -> Value {
+    object_schema(
+        json!({
+            "instance_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }),
+        vec!["instance_id"],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tool_list_contains_m6_tools() {
+    fn tool_list_contains_world_and_build_plan_tools() {
         let names = tool_definitions()
             .into_iter()
             .map(|tool| {
@@ -507,6 +808,19 @@ mod tests {
                 "set_block",
                 "remove_block",
                 "fill_region",
+                "validate_build_plan",
+                "apply_build_plan",
+                "get_build",
+                "undo_build",
+                "validate_sculpt_spec",
+                "inspect_asset_budget",
+                "publish_asset",
+                "list_assets",
+                "get_asset",
+                "spawn_asset",
+                "update_asset",
+                "remove_asset",
+                "list_asset_instances",
             ]
         );
     }
@@ -577,7 +891,26 @@ mod tests {
                 .as_array()
                 .expect("tools should be an array")
                 .len(),
-            8
+            21
         );
+    }
+
+    #[test]
+    fn validation_and_lookup_tools_are_annotated_read_only() {
+        for name in [
+            "validate_build_plan",
+            "get_build",
+            "validate_sculpt_spec",
+            "inspect_asset_budget",
+            "list_assets",
+            "get_asset",
+            "list_asset_instances",
+        ] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .expect("tool should be listed");
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
     }
 }
