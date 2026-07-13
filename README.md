@@ -215,14 +215,18 @@ Read-only:
 - `server_status`: tick, player count, bounds, database path, Anvil region path, MCP endpoint, MSPT telemetry, chunk interest/lifecycle stats, bridge backpressure config, SQLite schema/save format versions, dirty chunk count, and writer queue stats.
 - `list_players`: connected player names, positions, and ping.
 - `get_world_bounds`: bounded world coordinates.
+- `list_build_palette`: read-only discovery for the versioned 115-block
+  building palette and representative color metadata.
 - `get_block`: one live block.
 - `snapshot_region`: live block snapshot with max volume `512`.
 
 Edit:
 
-- `set_block`: one block; supported blocks are `stone`, `dirt`, `grass_block`, `oak_planks`, `cobblestone`, and `glass`.
+- `set_block`: one block from Build Palette v1; call `list_build_palette` for
+  canonical names.
 - `remove_block`: one block removal.
-- `fill_region`: bounded cuboid edit with max volume `128`; accepts the same set blocks plus `air` for removal.
+- `fill_region`: bounded cuboid edit with max volume `128`; accepts the same
+  build palette plus `air` for removal.
 
 All edit tools use `WorldCommand`, so bounds, spawn protection, foundation protection, supported block checks, target occupancy, and placement anchor rules still apply.
 

@@ -13,6 +13,9 @@ use crate::asset_service::{
     self, AssetProtocolEvent, AssetService, ASSET_CHANNEL, ASSET_READY_CHANNEL,
 };
 use crate::bridge::BridgeRuntime;
+use crate::build_palette::{
+    build_palette_entries, BUILD_PALETTE_BLOCK_COUNT, BUILD_PALETTE_VERSION, MINECRAFT_VERSION,
+};
 use crate::build_plan::prepare_build_plan;
 use crate::build_service::{self, PositionKey};
 use crate::mcp::{
@@ -698,6 +701,10 @@ fn handle_mcp_tool(
                 "server_version": env!("CARGO_PKG_VERSION"),
                 "tick": context.server.current_tick(),
                 "connected_players": context.players.len(),
+                "build_palette": {
+                    "version": BUILD_PALETTE_VERSION,
+                    "blocks": BUILD_PALETTE_BLOCK_COUNT,
+                },
                 "assets": {
                     "catalog_entries": context.assets.list_assets().len(),
                     "active_instances": context.assets.list_instances().len(),
@@ -722,6 +729,11 @@ fn handle_mcp_tool(
             "players": context.players,
         })),
         "get_world_bounds" => Ok(world_bounds_json(context.bounds)),
+        "list_build_palette" => Ok(serde_json::json!({
+            "palette_version": BUILD_PALETTE_VERSION,
+            "minecraft_version": MINECRAFT_VERSION,
+            "blocks": build_palette_entries(),
+        })),
         "get_block" => {
             let position = required_block_pos(&request.arguments)?;
             ensure_in_bounds(context.bounds, position)?;

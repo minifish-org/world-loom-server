@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use valence::prelude::{BlockPos, BlockState, Resource};
 
+use crate::build_palette::{block_name_for_state, parse_build_block_name};
 use crate::build_plan::{parse_build_plan, BuildPlan, MAX_BUILD_OPERATIONS, MAX_BUILD_TARGETS};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -86,35 +87,23 @@ impl Region {
 }
 
 pub fn parse_block_name(name: &str) -> Option<BlockState> {
-    let normalized = name
-        .trim()
+    let trimmed = name.trim();
+    let normalized = trimmed
         .strip_prefix("minecraft:")
-        .unwrap_or(name.trim())
+        .unwrap_or(trimmed)
         .to_ascii_lowercase();
-
-    match normalized.as_str() {
-        "air" => Some(BlockState::AIR),
-        "stone" => Some(BlockState::STONE),
-        "dirt" => Some(BlockState::DIRT),
-        "grass_block" => Some(BlockState::GRASS_BLOCK),
-        "oak_planks" => Some(BlockState::OAK_PLANKS),
-        "cobblestone" => Some(BlockState::COBBLESTONE),
-        "glass" => Some(BlockState::GLASS),
-        _ => None,
-    }
+    (normalized == "air")
+        .then_some(BlockState::AIR)
+        .or_else(|| parse_build_block_name(&normalized))
 }
 
 pub fn block_state_name(block: BlockState) -> String {
     match block {
         BlockState::AIR => "air".to_string(),
         BlockState::BEDROCK => "bedrock".to_string(),
-        BlockState::STONE => "stone".to_string(),
-        BlockState::DIRT => "dirt".to_string(),
-        BlockState::GRASS_BLOCK => "grass_block".to_string(),
-        BlockState::OAK_PLANKS => "oak_planks".to_string(),
-        BlockState::COBBLESTONE => "cobblestone".to_string(),
-        BlockState::GLASS => "glass".to_string(),
-        _ => block.to_string(),
+        _ => block_name_for_state(block)
+            .map(str::to_string)
+            .unwrap_or_else(|| block.to_string()),
     }
 }
 
@@ -246,6 +235,13 @@ pub fn tool_definitions() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
+            "name": "list_build_palette",
+            "title": "List Build Palette",
+            "description": "List the authoritative Build Palette v1 block names and visual metadata.",
+            "inputSchema": object_schema(json!({}), vec![]),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
             "name": "get_block",
             "title": "Get Block",
             "description": "Inspect one block in the live server world.",
@@ -262,7 +258,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "set_block",
             "title": "Set Block",
-            "description": "Set one block through WorldCommand validation. Supported blocks: stone, dirt, grass_block, oak_planks, cobblestone, glass.",
+            "description": "Set one block through WorldCommand validation. Call list_build_palette for supported names.",
             "inputSchema": block_edit_schema(),
             "annotations": { "destructiveHint": false }
         }),
@@ -380,6 +376,7 @@ pub fn is_known_tool(name: &str) -> bool {
         "server_status"
             | "list_players"
             | "get_world_bounds"
+            | "list_build_palette"
             | "get_block"
             | "snapshot_region"
             | "set_block"
@@ -588,7 +585,7 @@ fn block_edit_schema() -> Value {
             "z": integer_property("Block Z coordinate"),
             "block": {
                 "type": "string",
-                "enum": ["stone", "dirt", "grass_block", "oak_planks", "cobblestone", "glass"],
+                "description": "Canonical name returned by list_build_palette; air is not accepted here",
             },
         }),
         vec!["x", "y", "z", "block"],
@@ -620,7 +617,7 @@ fn fill_region_schema() -> Value {
             "max_z": integer_property("Maximum Z coordinate"),
             "block": {
                 "type": "string",
-                "enum": ["air", "stone", "dirt", "grass_block", "oak_planks", "cobblestone", "glass"],
+                "description": "Canonical name returned by list_build_palette, or air for removal",
             },
         }),
         vec![
@@ -803,6 +800,7 @@ mod tests {
                 "server_status",
                 "list_players",
                 "get_world_bounds",
+                "list_build_palette",
                 "get_block",
                 "snapshot_region",
                 "set_block",
@@ -869,8 +867,15 @@ mod tests {
     #[test]
     fn block_names_are_limited_to_world_command_blocks() {
         assert_eq!(parse_block_name("minecraft:stone"), Some(BlockState::STONE));
-        assert_eq!(parse_block_name("glass"), Some(BlockState::GLASS));
-        assert_eq!(parse_block_name("diamond_block"), None);
+        assert_eq!(
+            parse_block_name("RED_CONCRETE"),
+            Some(BlockState::RED_CONCRETE)
+        );
+        assert_eq!(
+            parse_block_name("diamond_block"),
+            Some(BlockState::DIAMOND_BLOCK)
+        );
+        assert_eq!(parse_block_name("sand"), None);
     }
 
     #[test]
@@ -891,13 +896,14 @@ mod tests {
                 .as_array()
                 .expect("tools should be an array")
                 .len(),
-            21
+            22
         );
     }
 
     #[test]
     fn validation_and_lookup_tools_are_annotated_read_only() {
         for name in [
+            "list_build_palette",
             "validate_build_plan",
             "get_build",
             "validate_sculpt_spec",
@@ -911,6 +917,23 @@ mod tests {
                 .find(|tool| tool["name"] == name)
                 .expect("tool should be listed");
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
+    }
+
+    #[test]
+    fn direct_edit_schemas_defer_to_the_runtime_palette() {
+        for name in ["set_block", "fill_region"] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .expect("tool should be listed");
+            let block = &tool["inputSchema"]["properties"]["block"];
+            assert_eq!(block["type"], "string");
+            assert!(block.get("enum").is_none());
+            assert!(block["description"]
+                .as_str()
+                .expect("block description")
+                .contains("list_build_palette"));
         }
     }
 }

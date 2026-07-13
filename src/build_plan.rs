@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use valence::prelude::{BlockPos, BlockState};
 
+use crate::build_palette::block_state_for_name;
 use crate::world_command::WorldBounds;
 
 pub const BUILD_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -270,18 +271,6 @@ pub fn prepare_build_plan(plan: BuildPlan, world_bounds: WorldBounds) -> Prepare
     }
 }
 
-pub fn block_state_for_name(name: &str) -> Option<BlockState> {
-    match name {
-        "stone" => Some(BlockState::STONE),
-        "dirt" => Some(BlockState::DIRT),
-        "grass_block" => Some(BlockState::GRASS_BLOCK),
-        "oak_planks" => Some(BlockState::OAK_PLANKS),
-        "cobblestone" => Some(BlockState::COBBLESTONE),
-        "glass" => Some(BlockState::GLASS),
-        _ => None,
-    }
-}
-
 pub fn expanded_bounds(targets: &[ExpandedTarget]) -> Option<PlanBounds> {
     let first = targets.first()?.position;
     let mut min = first;
@@ -368,6 +357,33 @@ mod tests {
             WORLD_BOUNDS,
         );
         assert_eq!(prepared.conflicts[0].code, "duplicate_target");
+    }
+
+    #[test]
+    fn expanded_palette_blocks_are_supported_without_changing_schema_v1() {
+        let prepared = prepare_build_plan(
+            plan(vec![
+                BuildOperation::Set {
+                    at: [0, 0, 0],
+                    block: "red_concrete".to_string(),
+                },
+                BuildOperation::Set {
+                    at: [1, 0, 0],
+                    block: "blue_wool".to_string(),
+                },
+                BuildOperation::Set {
+                    at: [2, 0, 0],
+                    block: "white_stained_glass".to_string(),
+                },
+            ]),
+            WORLD_BOUNDS,
+        );
+
+        assert!(prepared.conflicts.is_empty());
+        assert_eq!(prepared.plan.schema_version, BUILD_PLAN_SCHEMA_VERSION);
+        assert_eq!(prepared.targets[0].block, BlockState::RED_CONCRETE);
+        assert_eq!(prepared.targets[1].block, BlockState::BLUE_WOOL);
+        assert_eq!(prepared.targets[2].block, BlockState::WHITE_STAINED_GLASS);
     }
 
     #[test]

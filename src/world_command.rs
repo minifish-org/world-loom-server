@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use valence::prelude::{BlockPos, BlockState, ItemKind};
 use valence::{ChunkLayer, ChunkPos};
 
+use crate::build_palette::contains_block_state;
+
 pub const GROUND_Y: i32 = 64;
 pub const SPAWN_FEET_Y: i32 = GROUND_Y + 1;
 pub const SPAWN_HEAD_Y: i32 = GROUND_Y + 2;
@@ -24,15 +26,6 @@ pub const HOTBAR_BLOCKS: [ItemKind; 6] = [
     ItemKind::OakPlanks,
     ItemKind::Cobblestone,
     ItemKind::Glass,
-];
-
-const ALLOWED_SET_BLOCKS: [BlockState; 6] = [
-    BlockState::STONE,
-    BlockState::DIRT,
-    BlockState::GRASS_BLOCK,
-    BlockState::OAK_PLANKS,
-    BlockState::COBBLESTONE,
-    BlockState::GLASS,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +210,9 @@ impl fmt::Display for WorldCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OutOfBounds { position } => write!(f, "position {position:?} is outside bounds"),
-            Self::UnsupportedBlock { block } => write!(f, "block {block} is not allowed in M2"),
+            Self::UnsupportedBlock { block } => {
+                write!(f, "block {block} is not in Build Palette v1")
+            }
             Self::TargetNotEmpty { position, current } => {
                 write!(f, "position {position:?} already contains {current}")
             }
@@ -290,7 +285,7 @@ fn validate_position(bounds: WorldBounds, position: BlockPos) -> Result<(), Worl
 }
 
 fn validate_set_block_type(block: BlockState) -> Result<(), WorldCommandError> {
-    if ALLOWED_SET_BLOCKS.contains(&block) {
+    if contains_block_state(block) {
         Ok(())
     } else {
         Err(WorldCommandError::UnsupportedBlock { block })
@@ -382,15 +377,21 @@ mod tests {
 
     #[test]
     fn set_block_accepts_allowed_block_inside_bounds() {
-        let command = WorldCommand::SetBlock {
-            position: pos(4, GROUND_Y + 1, 4),
-            block: BlockState::STONE,
-        };
-
-        assert_eq!(
-            validate_world_command(WORLD_BOUNDS, command, placement_context()),
-            Ok(())
-        );
+        for block in [
+            BlockState::STONE,
+            BlockState::RED_CONCRETE,
+            BlockState::BLUE_WOOL,
+            BlockState::WHITE_STAINED_GLASS,
+        ] {
+            let command = WorldCommand::SetBlock {
+                position: pos(4, GROUND_Y + 1, 4),
+                block,
+            };
+            assert_eq!(
+                validate_world_command(WORLD_BOUNDS, command, placement_context()),
+                Ok(())
+            );
+        }
     }
 
     #[test]
@@ -412,13 +413,13 @@ mod tests {
     fn set_block_rejects_unsupported_block_type() {
         let command = WorldCommand::SetBlock {
             position: pos(4, GROUND_Y + 1, 4),
-            block: BlockState::DIAMOND_BLOCK,
+            block: BlockState::SAND,
         };
 
         assert_eq!(
             validate_world_command(WORLD_BOUNDS, command, placement_context()),
             Err(WorldCommandError::UnsupportedBlock {
-                block: BlockState::DIAMOND_BLOCK
+                block: BlockState::SAND
             })
         );
     }

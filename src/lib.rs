@@ -1,5 +1,6 @@
 pub mod asset_service;
 pub mod bridge;
+pub mod build_palette;
 pub mod build_plan;
 pub mod build_service;
 pub mod mcp;

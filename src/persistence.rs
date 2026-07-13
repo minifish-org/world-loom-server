@@ -2281,6 +2281,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> PersistenceResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_palette::BUILD_PALETTE;
     use crate::world_command::GROUND_Y;
 
     fn temp_db_path(name: &str) -> PathBuf {
@@ -2327,6 +2328,16 @@ mod tests {
 
     fn pos(x: i32, y: i32, z: i32) -> BlockPos {
         BlockPos::new(x, y, z)
+    }
+
+    #[test]
+    fn every_build_palette_state_round_trips_through_anvil_metadata() {
+        for entry in BUILD_PALETTE {
+            let encoded = anvil_palette_entry_for_block(entry.block);
+            let decoded = block_state_from_anvil_palette_entry(&encoded)
+                .unwrap_or_else(|error| panic!("failed to decode {}: {error}", entry.name));
+            assert_eq!(decoded, entry.block, "Anvil mismatch for {}", entry.name);
+        }
     }
 
     fn command_log_count(path: &Path) -> i64 {
