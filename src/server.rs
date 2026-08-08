@@ -2,16 +2,12 @@ use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::time::Instant;
 
-use valence::custom_payload::CustomPayloadEvent;
 use valence::interact_block::InteractBlockEvent;
 use valence::inventory::HeldItem;
 use valence::keepalive::Ping;
 use valence::prelude::*;
 use valence::spawn::IsFlat;
 
-use crate::asset_service::{
-    self, AssetProtocolEvent, AssetService, ASSET_CHANNEL, ASSET_READY_CHANNEL,
-};
 use crate::bridge::BridgeRuntime;
 use crate::build_palette::{
     build_palette_entries, BUILD_PALETTE_BLOCK_COUNT, BUILD_PALETTE_VERSION, MINECRAFT_VERSION,
@@ -19,9 +15,9 @@ use crate::build_palette::{
 use crate::build_plan::prepare_build_plan;
 use crate::build_service::{self, PositionKey};
 use crate::mcp::{
-    block_json, block_state_name, optional_u32, required_block_pos, required_block_state,
-    required_build_id, required_build_plan, required_region, required_sculpt_spec, required_string,
-    McpRuntime, McpToolRequest, MAX_FILL_BLOCKS, MAX_SNAPSHOT_BLOCKS, MCP_ENDPOINT_PATH,
+    block_json, block_state_name, required_block_pos, required_block_state, required_build_id,
+    required_build_plan, required_region, McpRuntime, McpToolRequest, MAX_FILL_BLOCKS,
+    MAX_SNAPSHOT_BLOCKS, MCP_ENDPOINT_PATH,
 };
 use crate::persistence::{PersistenceRuntime, PersistenceStatsSnapshot, StoredChunk};
 use crate::world_command::{
@@ -196,8 +192,6 @@ pub fn run() {
         .unwrap_or_else(|error| panic!("invalid {GAME_ADDR_ENV}: {error}"));
     let persistence = PersistenceRuntime::open_default()
         .unwrap_or_else(|err| panic!("failed to initialize SQLite persistence: {err}"));
-    let asset_service = AssetService::load(&persistence)
-        .unwrap_or_else(|err| panic!("failed to initialize declarative asset catalog: {err}"));
     let persistence_stats = persistence.stats_snapshot();
     println!(
         "[world-loom] storage={} schema_version={} save_format_version={} path={} legacy_block_overrides={}",
@@ -250,7 +244,6 @@ pub fn run() {
         .insert_resource(ChunkLifecycle::default())
         .insert_resource(ServerTelemetry::default())
         .insert_resource(persistence)
-        .insert_resource(asset_service)
         .insert_resource(mcp)
         .insert_resource(bridge)
         .add_plugins(DefaultPlugins)
@@ -264,8 +257,6 @@ pub fn run() {
                 handle_player_digging,
                 handle_player_placement,
                 handle_mcp_requests,
-                handle_asset_ready_events,
-                broadcast_asset_events.after(handle_mcp_requests),
                 update_debug_telemetry,
             ),
         )
@@ -641,7 +632,6 @@ fn handle_mcp_requests(
     mut layers: Query<&mut ChunkLayer>,
     rules: Res<WorldRules>,
     persistence: Res<PersistenceRuntime>,
-    mut assets: ResMut<AssetService>,
     telemetry: Res<ServerTelemetry>,
     interest: Res<InterestConfig>,
     bridge: Res<BridgeRuntime>,
@@ -659,7 +649,6 @@ fn handle_mcp_requests(
                 server: &server,
                 bounds: rules.bounds,
                 persistence: &persistence,
-                assets: &mut assets,
                 telemetry: telemetry.snapshot(),
                 interest: &interest,
                 bridge: &bridge,
@@ -678,7 +667,6 @@ struct McpToolContext<'a> {
     server: &'a Server,
     bounds: WorldBounds,
     persistence: &'a PersistenceRuntime,
-    assets: &'a mut AssetService,
     telemetry: &'a TelemetrySnapshot,
     interest: &'a InterestConfig,
     bridge: &'a BridgeRuntime,
@@ -704,11 +692,6 @@ fn handle_mcp_tool(
                 "build_palette": {
                     "version": BUILD_PALETTE_VERSION,
                     "blocks": BUILD_PALETTE_BLOCK_COUNT,
-                },
-                "assets": {
-                    "catalog_entries": context.assets.list_assets().len(),
-                    "active_instances": context.assets.list_instances().len(),
-                    "protocol_channel": ASSET_CHANNEL,
                 },
                 "world_bounds": world_bounds_json(context.bounds),
                 "database_path": context.persistence.db_path().display().to_string(),
@@ -921,109 +904,7 @@ fn handle_mcp_tool(
             serde_json::to_value(result)
                 .map_err(|error| format!("serialize undo result failed: {error}"))
         }
-        "validate_sculpt_spec" | "inspect_asset_budget" => {
-            let spec = required_sculpt_spec(&request.arguments)?;
-            serde_json::to_value(AssetService::validate_spec_value(spec)?)
-                .map_err(|error| format!("serialize SculptSpec report failed: {error}"))
-        }
-        "publish_asset" => {
-            let spec = required_sculpt_spec(&request.arguments)?;
-            let asset = context.assets.publish(context.persistence, spec)?;
-            serde_json::to_value(asset)
-                .map_err(|error| format!("serialize published asset failed: {error}"))
-        }
-        "list_assets" => Ok(serde_json::json!({
-            "assets": context.assets.list_assets(),
-        })),
-        "get_asset" => {
-            let asset_id = required_string(&request.arguments, "asset_id", 64)?;
-            let version = optional_u32(&request.arguments, "version")?;
-            let asset =
-                context
-                    .assets
-                    .get_asset(asset_id, version)
-                    .ok_or_else(|| match version {
-                        Some(version) => format!("unknown asset {asset_id}@{version}"),
-                        None => format!("unknown asset `{asset_id}`"),
-                    })?;
-            serde_json::to_value(asset).map_err(|error| format!("serialize asset failed: {error}"))
-        }
-        "spawn_asset" => {
-            let spawn = asset_service::parse_spawn_request(&request.arguments)?;
-            let instance = context
-                .assets
-                .spawn(context.persistence, context.bounds, spawn)?;
-            serde_json::to_value(instance)
-                .map_err(|error| format!("serialize asset instance failed: {error}"))
-        }
-        "update_asset" => {
-            let update = asset_service::parse_update_request(&request.arguments)?;
-            let instance = context
-                .assets
-                .update(context.persistence, context.bounds, update)?;
-            serde_json::to_value(instance)
-                .map_err(|error| format!("serialize asset instance failed: {error}"))
-        }
-        "remove_asset" => {
-            let instance_id = required_string(&request.arguments, "instance_id", 128)?;
-            context.assets.remove(context.persistence, instance_id)
-        }
-        "list_asset_instances" => Ok(serde_json::json!({
-            "instances": context.assets.list_instances(),
-        })),
         _ => Err(format!("unknown MCP tool `{}`", request.name)),
-    }
-}
-
-fn handle_asset_ready_events(
-    mut ready_events: EventReader<CustomPayloadEvent>,
-    assets: Res<AssetService>,
-    mut clients: Query<&mut Client>,
-) {
-    for event in ready_events.iter() {
-        if event.channel.as_str() != ASSET_READY_CHANNEL {
-            continue;
-        }
-        let Ok(mut client) = clients.get_mut(event.client) else {
-            continue;
-        };
-        if let Err(error) = send_asset_event(&mut client, &assets.snapshot_event()) {
-            eprintln!("[world-loom] failed to send asset catalog snapshot: {error}");
-        }
-    }
-}
-
-fn broadcast_asset_events(mut assets: ResMut<AssetService>, mut clients: Query<&mut Client>) {
-    for event in assets.drain_events() {
-        for mut client in &mut clients {
-            if let Err(error) = send_asset_event(&mut client, &event) {
-                eprintln!("[world-loom] failed to broadcast asset event: {error}");
-            }
-        }
-    }
-}
-
-fn send_asset_event(client: &mut Client, event: &AssetProtocolEvent) -> Result<(), String> {
-    let json = asset_service::serialize_asset_event(event)?;
-    let mut payload = encode_varint(json.len())?;
-    payload.extend_from_slice(&json);
-    client.send_custom_payload(ident!("world-loom:assets-v1"), &payload);
-    Ok(())
-}
-
-fn encode_varint(value: usize) -> Result<Vec<u8>, String> {
-    let mut value = u32::try_from(value).map_err(|_| "payload length exceeds u32".to_string())?;
-    let mut encoded = Vec::with_capacity(5);
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        encoded.push(byte);
-        if value == 0 {
-            return Ok(encoded);
-        }
     }
 }
 
