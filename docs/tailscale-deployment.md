@@ -98,6 +98,24 @@ If the host has public network interfaces, bind Caddy to the Tailscale IP rather
 
 For quick debugging, Tailscale Serve can reverse proxy local services inside the tailnet. Use it only to check basic reachability; keep Caddy as the recommended V1.2 runbook because it is explicit, inspectable, and easy to pair with the existing Rust bridge.
 
+For the `minifish-home` Docker deployment, Tailscale Serve is the production
+terminator because that host already uses it on `:443`. The container publishes
+its combined bridge/MCP listener to host loopback on `127.0.0.1:18082`; expose
+only the browser subtree so `/mcp` remains private:
+
+```sh
+tailscale serve --https=443 --set-path=/api/vm/net/ --bg \
+  http://127.0.0.1:18082
+```
+
+This path-specific handler coexists with the host's existing `/` handler. Save
+`tailscale serve status --json` before changing the configuration. Remove only
+the World Loom handler during rollback:
+
+```sh
+tailscale serve --https=443 --set-path=/api/vm/net/ off
+```
+
 ## Client Configuration
 
 Set the Cloudflare Pages build variables in `world-loom-client`:

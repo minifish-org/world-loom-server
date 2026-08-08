@@ -1,0 +1,9 @@
+.git
+.github
+.DS_Store
+backups
+data
+docs
+target
+*.log
+*.sqlite*

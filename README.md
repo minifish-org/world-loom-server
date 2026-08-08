@@ -95,6 +95,31 @@ cargo run
 
 The server listens on Valence's default `0.0.0.0:25565`.
 
+### Docker
+
+Build the production image for the homelab target:
+
+```sh
+docker build --platform linux/amd64 -t world-loom-server:local .
+```
+
+The container stores all durable state under `/var/lib/world-loom`. Mount that
+directory and publish only the browser bridge to host loopback:
+
+```sh
+docker run --rm \
+  -p 127.0.0.1:18082:18081 \
+  -v "$PWD/data:/var/lib/world-loom" \
+  -e WORLD_LOOM_ALLOWED_ORIGINS=https://world-loom-client.pages.dev \
+  -e WORLD_LOOM_HEALTH_ORIGIN=https://world-loom-client.pages.dev \
+  world-loom-server:local
+```
+
+The game listener on `25565` remains inside the container because the embedded
+browser bridge connects to it over container loopback. Production releases are
+published manually to GHCR by `.github/workflows/container.yml`; deployments
+must pin the resulting image digest instead of following a mutable tag.
+
 By default, V3.1 stores SQLite metadata at:
 
 ```text
@@ -190,6 +215,17 @@ Cloudflare Pages static client
 ```
 
 The deployment path keeps MCP on the bridge listener at `127.0.0.1:18081/mcp` by default.
+
+For a host that already owns Tailscale HTTPS `:443`, mount only the browser
+prefix and leave MCP private:
+
+```sh
+tailscale serve --https=443 --set-path=/api/vm/net/ --bg \
+  http://127.0.0.1:18082
+```
+
+Codex can reach the private MCP endpoint through an SSH loopback tunnel without
+publishing `/mcp` through Tailscale Serve.
 
 ## Checks
 

@@ -1,7 +1,10 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
+use valence::app::AppExit;
 use valence::interact_block::InteractBlockEvent;
 use valence::inventory::HeldItem;
 use valence::keepalive::Ping;
@@ -34,6 +37,33 @@ const DEFAULT_GAME_ADDR: &str = "0.0.0.0:25565";
 const DEFAULT_VIEW_DISTANCE_CHUNKS: u8 = 6;
 const MAX_VIEW_DISTANCE_CHUNKS: u8 = 12;
 const CHUNK_LOAD_MARGIN: i32 = 1;
+
+#[derive(Resource, Debug, Clone)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    fn install() -> Self {
+        let requested = Arc::new(AtomicBool::new(false));
+
+        #[cfg(unix)]
+        for signal in [
+            signal_hook::consts::signal::SIGINT,
+            signal_hook::consts::signal::SIGTERM,
+        ] {
+            signal_hook::flag::register(signal, Arc::clone(&requested))
+                .unwrap_or_else(|error| panic!("failed to register shutdown signal: {error}"));
+        }
+
+        Self { requested }
+    }
+
+    #[cfg(test)]
+    fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+}
 
 #[derive(Resource, Debug, Clone, Copy)]
 struct WorldRules {
@@ -225,6 +255,7 @@ pub fn run() {
         bridge_config.max_pending_connections
     );
     let interest = InterestConfig::from_env();
+    let shutdown_signal = ShutdownSignal::install();
     println!(
         "[world-loom] chunk interest view_distance_chunks={} loaded_chunk_columns={}",
         interest.view_distance_chunks,
@@ -243,6 +274,7 @@ pub fn run() {
         .insert_resource(interest)
         .insert_resource(ChunkLifecycle::default())
         .insert_resource(ServerTelemetry::default())
+        .insert_resource(shutdown_signal)
         .insert_resource(persistence)
         .insert_resource(mcp)
         .insert_resource(bridge)
@@ -258,9 +290,17 @@ pub fn run() {
                 handle_player_placement,
                 handle_mcp_requests,
                 update_debug_telemetry,
+                exit_on_shutdown_signal,
             ),
         )
         .run();
+}
+
+fn exit_on_shutdown_signal(shutdown: Res<ShutdownSignal>, mut app_exit: EventWriter<AppExit>) {
+    if shutdown.requested.swap(false, Ordering::SeqCst) {
+        println!("[world-loom] shutdown signal received; flushing world state");
+        app_exit.send(AppExit);
+    }
 }
 
 fn setup_world(
@@ -1294,6 +1334,7 @@ fn bounded_view_distance(raw: Option<&str>) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use valence::ecs::event::ManualEventReader;
 
     #[test]
     fn telemetry_formats_player_count_and_ping() {
@@ -1341,5 +1382,30 @@ mod tests {
         assert_eq!(bounded_view_distance(Some("64")), MAX_VIEW_DISTANCE_CHUNKS);
         assert_eq!(bounded_view_distance(Some("8")), 8);
         assert_eq!(interest_chunk_capacity(2), 25);
+    }
+
+    #[test]
+    fn shutdown_signal_emits_app_exit_once() {
+        let shutdown = ShutdownSignal {
+            requested: Arc::new(AtomicBool::new(false)),
+        };
+        let trigger = shutdown.clone();
+        let mut reader = ManualEventReader::<AppExit>::default();
+        let mut app = App::new();
+        app.insert_resource(shutdown)
+            .add_systems(Update, exit_on_shutdown_signal);
+
+        trigger.request();
+        app.update();
+        assert_eq!(
+            reader.iter(app.world.resource::<Events<AppExit>>()).count(),
+            1
+        );
+
+        app.update();
+        assert_eq!(
+            reader.iter(app.world.resource::<Events<AppExit>>()).count(),
+            0
+        );
     }
 }
