@@ -126,10 +126,17 @@ struct PlayerTelemetry {
     ping_ms: i32,
 }
 
-#[derive(Debug)]
-struct TelemetrySample {
-    tick: i64,
-    instant: Instant,
+#[derive(Resource, Debug)]
+struct TickTiming {
+    started_at: Instant,
+}
+
+impl Default for TickTiming {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Resource, Debug)]
@@ -274,11 +281,13 @@ pub fn run() {
         .insert_resource(interest)
         .insert_resource(ChunkLifecycle::default())
         .insert_resource(ServerTelemetry::default())
+        .insert_resource(TickTiming::default())
         .insert_resource(shutdown_signal)
         .insert_resource(persistence)
         .insert_resource(mcp)
         .insert_resource(bridge)
         .add_plugins(DefaultPlugins)
+        .add_systems(First, start_tick_timing)
         .add_systems(Startup, setup_world)
         .add_systems(
             Update,
@@ -289,11 +298,15 @@ pub fn run() {
                 handle_player_digging,
                 handle_player_placement,
                 handle_mcp_requests,
-                update_debug_telemetry,
                 exit_on_shutdown_signal,
             ),
         )
+        .add_systems(Last, update_debug_telemetry)
         .run();
+}
+
+fn start_tick_timing(mut timing: ResMut<TickTiming>) {
+    timing.started_at = Instant::now();
 }
 
 fn exit_on_shutdown_signal(shutdown: Res<ShutdownSignal>, mut app_exit: EventWriter<AppExit>) {
@@ -1195,27 +1208,14 @@ fn update_debug_telemetry(
     interest: Res<InterestConfig>,
     rules: Res<WorldRules>,
     mut telemetry: ResMut<ServerTelemetry>,
-    mut last_report: Local<Option<TelemetrySample>>,
+    timing: Res<TickTiming>,
 ) {
     let tick = server.current_tick();
-    if last_report
-        .as_ref()
-        .is_some_and(|sample| sample.tick == tick)
-        || tick % TELEMETRY_INTERVAL_TICKS != 0
-    {
+    if tick % TELEMETRY_INTERVAL_TICKS != 0 {
         return;
     }
 
-    let now = Instant::now();
-    let tick_delta_ms = last_report
-        .as_ref()
-        .map(|sample| {
-            let elapsed_ms = now.duration_since(sample.instant).as_secs_f64() * 1000.0;
-            let elapsed_ticks = (tick - sample.tick).max(1) as f64;
-            elapsed_ms / elapsed_ticks
-        })
-        .unwrap_or(0.0);
-    *last_report = Some(TelemetrySample { tick, instant: now });
+    let tick_delta_ms = timing.started_at.elapsed().as_secs_f64() * 1000.0;
 
     let mut players = Vec::new();
 
