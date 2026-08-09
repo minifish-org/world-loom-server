@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
     net::{SocketAddr, ToSocketAddrs},
+    path::Path,
     sync::mpsc::Sender as StdSender,
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
@@ -18,7 +19,7 @@ use axum::{
     http::{
         header::{
             ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-            ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, ORIGIN,
+            ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE,
         },
         HeaderMap, HeaderValue, StatusCode,
     },
@@ -28,6 +29,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -42,6 +44,7 @@ pub const BRIDGE_ALLOWED_ORIGINS_ENV: &str = "WORLD_LOOM_ALLOWED_ORIGINS";
 pub const BRIDGE_TCP_READ_BUFFER_BYTES_ENV: &str = "WORLD_LOOM_BRIDGE_TCP_READ_BUFFER_BYTES";
 pub const BRIDGE_WS_QUEUE_CAPACITY_ENV: &str = "WORLD_LOOM_BRIDGE_WS_QUEUE_CAPACITY";
 pub const BRIDGE_MAX_PENDING_CONNECTIONS_ENV: &str = "WORLD_LOOM_BRIDGE_MAX_PENDING_CONNECTIONS";
+pub const MCP_API_KEY_FILE_ENV: &str = "WORLD_LOOM_MCP_API_KEY_FILE";
 pub const DEFAULT_BRIDGE_ADDR: &str = "127.0.0.1:18081";
 
 const API_ROOT: &str = "/api/vm/net";
@@ -95,7 +98,8 @@ impl BridgeRuntime {
             .ok_or_else(|| BridgeError::InvalidAddress(requested_addr.clone()))?;
         let allowed_origins = AllowedOrigins::from_env();
         let config = BridgeConfig::from_env();
-        Self::start(addr, allowed_origins, config, mcp_sender)
+        let mcp_auth = McpAuth::from_env().map_err(BridgeError::Startup)?;
+        Self::start(addr, allowed_origins, config, mcp_auth, mcp_sender)
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -110,6 +114,7 @@ impl BridgeRuntime {
         addr: SocketAddr,
         allowed_origins: AllowedOrigins,
         config: BridgeConfig,
+        mcp_auth: McpAuth,
         mcp_sender: StdSender<McpToolRequest>,
     ) -> Result<Self, BridgeError> {
         let listener = std::net::TcpListener::bind(addr).map_err(BridgeError::Bind)?;
@@ -142,7 +147,7 @@ impl BridgeRuntime {
                             return;
                         }
                     };
-                    let state = BridgeState::new(allowed_origins, config, mcp_sender);
+                    let state = BridgeState::new(allowed_origins, config, mcp_auth, mcp_sender);
                     let app = Router::new()
                         .route(
                             &format!("{API_ROOT}/connect"),
@@ -237,6 +242,7 @@ impl BridgeConfig {
 struct BridgeState {
     pending_connections: Arc<Mutex<HashMap<String, TcpStream>>>,
     allowed_origins: Arc<AllowedOrigins>,
+    mcp_auth: McpAuth,
     mcp_sender: StdSender<McpToolRequest>,
     connect_timeout: Duration,
     config: BridgeConfig,
@@ -246,11 +252,13 @@ impl BridgeState {
     fn new(
         allowed_origins: AllowedOrigins,
         config: BridgeConfig,
+        mcp_auth: McpAuth,
         mcp_sender: StdSender<McpToolRequest>,
     ) -> Self {
         Self {
             pending_connections: Arc::new(Mutex::new(HashMap::new())),
             allowed_origins: Arc::new(allowed_origins),
+            mcp_auth,
             mcp_sender,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             config,
@@ -281,6 +289,10 @@ impl BridgeState {
             .unwrap_or_else(|| HeaderValue::from_static("null"))
     }
 
+    fn is_mcp_authorized(&self, headers: &HeaderMap) -> bool {
+        self.mcp_auth.is_authorized(headers)
+    }
+
     fn insert_pending_connection(&self, token: String, stream: TcpStream) -> Result<(), TcpStream> {
         let mut pending = self
             .pending_connections
@@ -293,6 +305,71 @@ impl BridgeState {
         pending.insert(token, stream);
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct McpAuth {
+    expected_digest: Option<[u8; 32]>,
+}
+
+impl McpAuth {
+    fn from_env() -> Result<Self, String> {
+        let Some(path) = env::var_os(MCP_API_KEY_FILE_ENV) else {
+            return Ok(Self::disabled());
+        };
+        let token = fs::read_to_string(Path::new(&path)).map_err(|error| {
+            format!(
+                "failed to read {MCP_API_KEY_FILE_ENV} file {}: {error}",
+                Path::new(&path).display()
+            )
+        })?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(format!("{MCP_API_KEY_FILE_ENV} file must not be empty"));
+        }
+        Ok(Self::required(token))
+    }
+
+    fn disabled() -> Self {
+        Self {
+            expected_digest: None,
+        }
+    }
+
+    fn required(token: &str) -> Self {
+        Self {
+            expected_digest: Some(Sha256::digest(token.as_bytes()).into()),
+        }
+    }
+
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(expected_digest) = self.expected_digest else {
+            return true;
+        };
+        let Some(value) = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        let Some((scheme, token)) = value.split_once(' ') else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() {
+            return false;
+        }
+        let actual_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        constant_time_digest_eq(&expected_digest, &actual_digest)
+    }
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +631,9 @@ async fn mcp_get(State(state): State<BridgeState>, headers: HeaderMap) -> Respon
     if !state.is_origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if !state.is_mcp_authorized(&headers) {
+        return mcp_unauthorized(headers, &state);
+    }
 
     mcp_http_response(headers, &state, 405, None)
 }
@@ -561,6 +641,9 @@ async fn mcp_get(State(state): State<BridgeState>, headers: HeaderMap) -> Respon
 async fn mcp_post(State(state): State<BridgeState>, headers: HeaderMap, body: Bytes) -> Response {
     if !state.is_origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.is_mcp_authorized(&headers) {
+        return mcp_unauthorized(headers, &state);
     }
 
     let mcp_sender = state.mcp_sender.clone();
@@ -579,6 +662,15 @@ async fn mcp_post(State(state): State<BridgeState>, headers: HeaderMap, body: By
         }
     };
     mcp_http_response(headers, &state, response.status, response.body)
+}
+
+fn mcp_unauthorized(headers: HeaderMap, state: &BridgeState) -> Response {
+    let mut response = mcp_http_response(headers, state, 401, None);
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"world-loom-mcp\""),
+    );
+    response
 }
 
 async fn handle_ping_socket(socket: WebSocket) {
@@ -808,39 +900,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bridge_serves_mcp_initialize_on_same_http_listener() {
-        let bridge = BridgeRuntime::start(
-            "127.0.0.1:0".parse().expect("socket addr"),
-            AllowedOrigins::Any,
-            BridgeConfig {
-                tcp_read_buffer_bytes: DEFAULT_TCP_READ_BUFFER_BYTES,
-                ws_queue_capacity: DEFAULT_WS_QUEUE_CAPACITY,
-                max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
-            },
-            std::sync::mpsc::channel().0,
-        )
-        .expect("bridge should start");
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize"
-        })
-        .to_string();
-        let request = format!(
-            "POST /mcp HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Origin: http://localhost:3000\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             \r\n\
-             {}",
-            bridge.addr(),
-            body.len(),
-            body
-        );
-
-        let mut stream = std::net::TcpStream::connect(bridge.addr()).expect("connect to bridge");
+    fn send_http_request(addr: SocketAddr, request: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect to bridge");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set read timeout");
@@ -865,7 +926,43 @@ mod tests {
                 Err(err) => panic!("read response: {err}"),
             }
         }
-        let response = String::from_utf8(response_bytes).expect("response should be utf8");
+        String::from_utf8(response_bytes).expect("response should be utf8")
+    }
+
+    #[test]
+    fn bridge_serves_mcp_initialize_on_same_http_listener() {
+        let bridge = BridgeRuntime::start(
+            "127.0.0.1:0".parse().expect("socket addr"),
+            AllowedOrigins::Any,
+            BridgeConfig {
+                tcp_read_buffer_bytes: DEFAULT_TCP_READ_BUFFER_BYTES,
+                ws_queue_capacity: DEFAULT_WS_QUEUE_CAPACITY,
+                max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
+            },
+            McpAuth::disabled(),
+            std::sync::mpsc::channel().0,
+        )
+        .expect("bridge should start");
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize"
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Origin: http://localhost:3000\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {}",
+            bridge.addr(),
+            body.len(),
+            body
+        );
+
+        let response = send_http_request(bridge.addr(), &request);
 
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
@@ -873,6 +970,57 @@ mod tests {
         );
         assert!(
             response.contains("\"name\":\"world-loom-server\""),
+            "unexpected response: {response}"
+        );
+    }
+
+    #[test]
+    fn mcp_bearer_auth_rejects_missing_and_invalid_tokens() {
+        let auth = McpAuth::required("correct-token");
+        let headers = HeaderMap::new();
+        assert!(!auth.is_authorized(&headers));
+
+        let mut invalid_headers = HeaderMap::new();
+        invalid_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert!(!auth.is_authorized(&invalid_headers));
+
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer correct-token"),
+        );
+        assert!(auth.is_authorized(&valid_headers));
+    }
+
+    #[test]
+    fn bridge_requires_bearer_auth_for_mcp_requests() {
+        let bridge = BridgeRuntime::start(
+            "127.0.0.1:0".parse().expect("socket addr"),
+            AllowedOrigins::Any,
+            BridgeConfig {
+                tcp_read_buffer_bytes: DEFAULT_TCP_READ_BUFFER_BYTES,
+                ws_queue_capacity: DEFAULT_WS_QUEUE_CAPACITY,
+                max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
+            },
+            McpAuth::required("correct-token"),
+            std::sync::mpsc::channel().0,
+        )
+        .expect("bridge should start");
+        let request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            bridge.addr()
+        );
+        let response = send_http_request(bridge.addr(), &request);
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("www-authenticate: Bearer realm=\"world-loom-mcp\""),
             "unexpected response: {response}"
         );
     }

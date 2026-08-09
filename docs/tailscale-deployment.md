@@ -16,7 +16,7 @@ Cloudflare Pages serves static files only. Do not add a Cloudflare Worker proxy 
 
 ```text
 25565  Valence Minecraft TCP server
-18081  Rust browser bridge HTTP/WebSocket endpoint and local MCP /mcp endpoint
+18081  Rust browser bridge HTTP/WebSocket endpoint and authenticated MCP /mcp endpoint
 443    Caddy HTTPS/WSS reverse proxy on the Tailscale host
 ```
 
@@ -24,7 +24,7 @@ Recommended binding:
 
 - `WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18081`
 - Caddy exposes the browser bridge over HTTPS to tailnet users.
-- MCP is served at `http://127.0.0.1:18081/mcp`; keep it local or route-protected unless a later milestone adds auth/permissions.
+- MCP is served at `http://127.0.0.1:18081/mcp`; production sets `WORLD_LOOM_MCP_API_KEY_FILE` and exposes it only inside the tailnet.
 
 ## Tailscale Prerequisites
 
@@ -52,6 +52,7 @@ Run the server:
 WORLD_LOOM_DB_PATH=/var/lib/world-loom/world-loom.sqlite3 \
 WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18081 \
 WORLD_LOOM_ALLOWED_ORIGINS=https://<project>.pages.dev,https://<custom-domain> \
+WORLD_LOOM_MCP_API_KEY_FILE=/run/secrets/world-loom-mcp-api-key \
 cargo run --release
 ```
 
@@ -100,12 +101,14 @@ For quick debugging, Tailscale Serve can reverse proxy local services inside the
 
 For the `minifish-home` Docker deployment, Tailscale Serve is the production
 terminator because that host already uses it on `:443`. The container publishes
-its combined bridge/MCP listener to host loopback on `127.0.0.1:18082`; expose
-only the browser subtree so `/mcp` remains private:
+its combined bridge/MCP listener to host loopback on `127.0.0.1:18082`. Expose
+the browser subtree and authenticated MCP route separately:
 
 ```sh
 tailscale serve --https=443 --set-path=/api/vm/net/ --bg \
-  http://127.0.0.1:18082
+  http://127.0.0.1:18082/api/vm/net/
+tailscale serve --https=443 --set-path=/mcp --bg \
+  http://127.0.0.1:18082/mcp
 ```
 
 This path-specific handler coexists with the host's existing `/` handler. Save
@@ -114,6 +117,7 @@ the World Loom handler during rollback:
 
 ```sh
 tailscale serve --https=443 --set-path=/api/vm/net/ off
+tailscale serve --https=443 --set-path=/mcp off
 ```
 
 ## Client Configuration
@@ -167,14 +171,15 @@ Restarting the server recreates an empty generated superflat world.
 1. Start `world-loom-server` with the deployment environment above.
 2. Start or reload Caddy.
 3. From a tailnet client, open `https://<machine>.<tailnet>.ts.net/api/vm/net/connect` and confirm JSON status.
-4. Open the Pages URL.
-5. Confirm the browser logs show the HTTPS proxy URL.
-6. Join with two browser clients, place and remove blocks, then restart the server and confirm edits persist.
+4. Confirm `/mcp` returns `401` without a token and initializes successfully with `Authorization: Bearer <token>`.
+5. Open the Pages URL.
+6. Confirm the browser logs show the HTTPS proxy URL.
+7. Join with two browser clients, place and remove blocks, then restart the server and confirm edits persist.
 
 ## Not V1.2
 
 - No public Cloudflare Worker TCP/WebSocket proxy.
-- No MCP exposure beyond local host.
+- No public MCP exposure or multi-user authorization system.
 - No new gameplay.
 - No V2 hybrid storage.
 - No Valence core fork.

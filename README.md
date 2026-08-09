@@ -34,7 +34,7 @@ M2 contains a minimal Valence-backed authoritative server prototype. M3 connects
 
 ## What M6 Adds
 
-- Local MCP endpoint at `http://127.0.0.1:18081/mcp`, served by the Rust bridge HTTP listener.
+- MCP endpoint at `/mcp`, served by the Rust bridge HTTP listener.
 - Streamable HTTP-style JSON-RPC support for `initialize`, `ping`, `tools/list`, and `tools/call`.
 - Read-only tools: `server_status`, `list_players`, `get_world_bounds`, `get_block`, `snapshot_region`.
 - Edit tools: `set_block`, `remove_block`, `fill_region`.
@@ -110,8 +110,10 @@ directory and publish only the browser bridge to host loopback:
 docker run --rm \
   -p 127.0.0.1:18082:18081 \
   -v "$PWD/data:/var/lib/world-loom" \
+  -v "$PWD/config/world-loom-mcp-api-key:/run/secrets/world-loom-mcp-api-key:ro" \
   -e WORLD_LOOM_ALLOWED_ORIGINS=https://world-loom-client.pages.dev \
   -e WORLD_LOOM_HEALTH_ORIGIN=https://world-loom-client.pages.dev \
+  -e WORLD_LOOM_MCP_API_KEY_FILE=/run/secrets/world-loom-mcp-api-key \
   world-loom-server:local
 ```
 
@@ -145,6 +147,18 @@ The MCP endpoint shares the browser bridge listener and defaults to:
 ```text
 http://127.0.0.1:18081/mcp
 ```
+
+Local development leaves MCP authentication disabled unless
+`WORLD_LOOM_MCP_API_KEY_FILE` points to a readable, non-empty token file. When
+configured, MCP GET and POST requests must send the token as a Bearer
+credential:
+
+```text
+Authorization: Bearer <token>
+```
+
+The token is hashed when the bridge starts and is never logged. Browser bridge
+routes under `/api/vm/net/` and their health checks do not require this token.
 
 The browser bridge endpoint defaults to:
 
@@ -216,16 +230,19 @@ Cloudflare Pages static client
 
 The deployment path keeps MCP on the bridge listener at `127.0.0.1:18081/mcp` by default.
 
-For a host that already owns Tailscale HTTPS `:443`, mount only the browser
-prefix and leave MCP private:
+For a host that already owns Tailscale HTTPS `:443`, mount the browser prefix
+and the authenticated MCP endpoint separately:
 
 ```sh
 tailscale serve --https=443 --set-path=/api/vm/net/ --bg \
-  http://127.0.0.1:18082
+  http://127.0.0.1:18082/api/vm/net/
+tailscale serve --https=443 --set-path=/mcp --bg \
+  http://127.0.0.1:18082/mcp
 ```
 
-Codex can reach the private MCP endpoint through an SSH loopback tunnel without
-publishing `/mcp` through Tailscale Serve.
+Codex can connect directly to the tailnet-only HTTPS `/mcp` URL with an
+`Authorization: Bearer ...` header. Do not enable Tailscale Funnel for this
+listener.
 
 ## Checks
 
@@ -334,7 +351,7 @@ The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and Anvil region
 
 ## Not In V3.1
 
-- No complex MCP permission system.
+- No multi-user or per-tool MCP permission system.
 - No public Cloudflare Worker proxy.
 - No client UI rewrite.
 - No new gameplay systems.
