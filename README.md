@@ -1,91 +1,66 @@
 # World Loom Server
 
-This repository owns the future Rust authoritative server for World Loom Online.
+An experimental Rust server where players and AI agents build in the same
+persistent voxel world. [Valence](https://github.com/valence-rs/valence) provides
+the Minecraft 1.20.1 protocol layer; this project owns world rules, SQLite/Anvil
+persistence, an embedded browser bridge, and MCP tools for inspected, validated
+and undoable edits.
 
-M2 contains a minimal Valence-backed authoritative server prototype. M3 connects the browser client. M4 verifies two browser clients sharing one server-backed world, including block place/remove replication, disconnect/reconnect, and basic telemetry. M5 persists block edits and restores them after server restart. M6 adds local MCP inspect/edit tools over the live world. V1.1 moves the browser WebSocket-to-TCP bridge into this Rust server process. V2 hardens multiplayer performance visibility and SQLite save reliability without adding gameplay. V3 adds chunk lifecycle and region-file chunk storage foundations. V3.1 replaces the temporary JSON region backend with Anvil `.mca` region files. The server remains intentionally small: no complex permission system, no new gameplay, and no Valence core fork.
+- Server-authoritative creative world shared by browser clients and agents.
+- Bounded edits validated through one command path.
+- Build plans with idempotent application and persistent undo records.
+- SQLite metadata and Anvil region storage survive restarts.
+- Optional MCP bearer authentication and explicit browser-origin checks.
 
-## What M2 Provides
+This is a prototype, not a complete Minecraft implementation or a public-server
+hosting platform. Game connections use offline identities, not authenticated
+accounts. Keep game and browser endpoints on loopback or a trusted private
+network. MCP authentication does not authenticate game players.
 
-- Valence server using Minecraft protocol 1.20.1.
-- Offline auth mode for local development.
-- Bounded superflat world centered at `0,0`.
-- Players spawn at the center in creative mode.
-- Hotbar slots contain basic building blocks.
-- Player block placement and removal route through `WorldCommand`.
-- `WorldCommand` validates bounds, allowed block types, empty placement targets, non-air anchors, spawn-space safety, and protected foundation blocks.
+Known Valence dependency advisories remain; read [SECURITY.md](SECURITY.md#known-dependency-advisories-2026-09-22)
+before deployment.
 
-## What M4 Adds
+## Try it without accounts or private infrastructure
 
-- Multiple browser clients can join the same in-memory server world.
-- Block place/remove mutations still route through `WorldCommand` and replicate through Valence world state.
-- Disconnect/reconnect keeps the in-memory world state valid while the server process remains running.
-- Debug telemetry reports server tick timing, connected player count, and per-player ping status through logs plus tab list/action bar messages.
-- Client FPS remains a browser-client concern and is shown through the existing client debug overlay when renderer FPS is available.
+Requires Rust 1.92 and Python 3.10+ on Linux or macOS. No browser, model API,
+Tailscale account or private coordination repository is needed for this demo.
 
-## What M5 Adds
+```sh
+git clone https://github.com/minifish-org/world-loom-server.git
+cd world-loom-server
+python3 scripts/demo.py
+```
 
-- SQLite persistence through `rusqlite`.
-- Successful `WorldCommand` mutations enqueue block edits to a background writer.
-- The writer batches updates and keeps disk I/O off the gameplay event path.
-- Server startup loads saved `block_overrides` after generating the bounded base world.
-- Reverting a cell back to its generated base block removes the override.
-- Removing a generated base-world block persists an explicit `air` override.
-- A command log records successful `set_block` and `remove_block` operations.
+The demo builds the server, starts an isolated temporary world on loopback,
+applies a block build through MCP, retries it idempotently, restarts the server,
+and undoes the persisted build. It stops its own server and deletes only its
+temporary data when finished.
 
-## What M6 Adds
+For an interactive world, use separate terminals:
 
-- MCP endpoint at `/mcp`, served by the Rust bridge HTTP listener.
-- Streamable HTTP-style JSON-RPC support for `initialize`, `ping`, `tools/list`, and `tools/call`.
-- Read-only tools: `server_status`, `list_players`, `get_world_bounds`, `get_block`, `snapshot_region`.
-- Edit tools: `set_block`, `remove_block`, `fill_region`.
-- MCP HTTP handlers enqueue requests only; live world reads/writes happen on the server update loop.
-- All MCP edit tools route through `WorldCommand` validation.
-- Successful MCP edits enqueue SQLite persistence and replicate to connected browser clients.
+```sh
+# Terminal 1: keep both listeners local.
+WORLD_LOOM_GAME_ADDR=127.0.0.1:25565 \
+WORLD_LOOM_BRIDGE_ADDR=127.0.0.1:18081 cargo run --locked
+```
 
-## What V1.1 Adds
+```sh
+# Terminal 2: public browser client, pinned compatible revision.
+git clone https://github.com/minifish-org/world-loom-client.git
+cd world-loom-client
+git checkout a0ea7764049e6f58d7859e92a1ea2f44f0414470
+# Install Node.js 22 and pnpm 10.32.1 first.
+pnpm install --frozen-lockfile
+pnpm start:world-loom
+```
 
-- Rust-owned browser bridge endpoint compatible with the existing `minecraft-web-client` proxy protocol.
-- Default bridge address: `http://127.0.0.1:18081/api/vm/net`.
-- Valence TCP remains on `0.0.0.0:25565`.
-- Browser traffic no longer requires the client-owned Node `server.js` bridge on the target path.
+Open `http://localhost:3000`, use server `localhost:25565`, protocol `1.20.1`,
+and proxy `:18081`. Use distinct usernames to try two browser clients.
+The client has its own license and asset/dependency requirements; see its README.
+A Minecraft Java 1.20.1-compatible desktop client can also join the local server.
 
-## What V1.2 Documents
-
-- Tailscale private-host deployment.
-- Caddy HTTPS/WSS reverse proxy in front of the local Rust bridge.
-- Pages/client environment variables and required allowed origins.
-- Persistent SQLite data directory, backup, and clear-save workflow.
-
-## What V2 Adds
-
-- Server tick/MSPT telemetry in logs, tab list/action bar, and MCP `server_status`.
-- Per-player ping visibility remains in tab/action bar, player list, and MCP status.
-- Valence `ViewDistance` based chunk interest management with a bounded server default.
-- Rust browser bridge backpressure knobs: TCP read buffer size, WebSocket queue capacity, and pending connection limit.
-- SQLite save format versioning with V1 metadata migration.
-- `WorldStorage` trait plus the current `SqliteDeltaStorage` implementation.
-- SQLite writer queue stats in MCP `server_status`.
-- Online-safe backup script with a JSON manifest.
-
-## What V3 Adds
-
-- Bounded world expands to 512x512 horizontal blocks, centered at `0,0`.
-- The server no longer generates or inserts every chunk at startup.
-- Chunks load/generate around player interest and unload when no longer needed.
-- MCP reads/edits load required chunks before accessing live world state.
-- `WorldStorage` now exposes chunk-oriented operations.
-- Successful edits still route through `WorldCommand`, then enqueue persistence work.
-- Backup and clear-save scripts cover both SQLite metadata and chunk bulk files.
-
-## What V3.1 Corrects
-
-- Production chunk bulk storage is now Anvil `.mca` region files through `AnvilChunkStorage`.
-- `HybridAnvilStorage` keeps SQLite for metadata, schema/save format version, command log, dirty chunk index, backup manifest, and legacy SQLite delta fallback.
-- The old V3 JSON region backend is not the default production path.
-- Unedited chunks are still generated from the deterministic superflat generator and are not written to disk.
-- Dirty chunks are written as Anvil region chunks; reverting a dirty chunk to generated base removes the Anvil chunk.
-- SQLite `storage_backend` is `anvil_chunk_sqlite_metadata`.
-- SQLite schema version is `4`; save format version is `3`.
+The MCP URL is `http://127.0.0.1:18081/mcp`. See [MCP tools](#mcp-tools) below.
+Historical implementation details are in [development milestones](docs/milestones.md).
 
 ## Run
 
@@ -252,14 +227,14 @@ cargo clippy
 cargo test
 ```
 
-The stack-level smoke tests start the local repos and run browser verification:
+Run the standalone integration demo against a temporary world:
 
 ```sh
-../scripts/smoke-m4-dual-client.sh
-../scripts/smoke-m5-persistence.sh
-../scripts/smoke-m6-mcp.sh
-../scripts/smoke-v3-storage.sh
+python3 scripts/demo.py
 ```
+
+Browser multiplayer checks are a separate manual step using the public client
+quick start above; the demo verifies MCP, persistence and undo without a browser.
 
 ## MCP Tools
 
@@ -362,3 +337,9 @@ The clear script deletes the DB, SQLite `-wal`/`-shm` sidecars, and Anvil region
 ## Next Direction
 
 After V3.1, the next practical work is V4 family-play hardening: production process management, MCP authorization/audit UX, simple admin backup/restore operations, and the first World Loom-specific visible behavior.
+
+## License
+
+AGPL-3.0-or-later; see [LICENSE](LICENSE). Dependencies and the separately
+distributed browser client retain their own licenses. No Minecraft game assets
+or private world saves are included in this server repository.
