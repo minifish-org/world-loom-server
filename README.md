@@ -97,6 +97,9 @@ browser bridge connects to it over container loopback. Production releases are
 published manually to GHCR by `.github/workflows/container.yml`; deployments
 must pin the resulting image digest instead of following a mutable tag.
 
+Prebuilt GHCR packages currently require registry access. The public quick start
+builds from source and does not need registry credentials.
+
 By default, V3.1 stores SQLite metadata at:
 
 ```text
